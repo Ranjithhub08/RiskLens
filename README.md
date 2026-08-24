@@ -1,0 +1,67 @@
+# RiskLens
+
+**Explainable, agentic merchant risk & freeze-advisory engine — built for the Razorpay AI Buildathon, AI Risk Manager track.**
+
+RiskLens scores merchant/transaction risk, explains every score in plain language, and never takes an irreversible action on its own. It classifies into clear / escalate / flag / needs-manual-review, always with a reason, and logs every decision to an append-only audit trail.
+
+It ships two ways to reach that decision: a **deterministic pipeline** for instant, fully-scripted scoring, and an **agentic pipeline** where an LLM investigates a real Razorpay test-mode transaction using tools, decides what to do, and proposes a decision — which the same fixed safety rules then check before anything counts as final.
+
+Full design rationale, data flow, the agent's reasoning-loop design, and a point-by-point mapping to the buildathon's judging criteria: see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+## Quick start
+
+```bash
+pip install -r requirements.txt
+
+# 1. Generate the synthetic dataset (stands in for real Razorpay data)
+python3 data/raw/generate_data.py
+
+# 2. Train the model and produce the metrics/plots the dashboard displays
+python3 model/train.py
+
+# 3. Run the test suite (works fully offline -- the agent tests use a
+#    scripted fake LLM client, no API key or network needed)
+pytest tests/ -v
+
+# 4. (Optional, for the "Live agent" tab) set up your own keys --
+#    never commit this file or paste real keys anywhere
+cp .env.example .env
+# then edit .env and fill in GROQ_API_KEY and your Razorpay TEST-mode
+# RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET
+
+# 5. Launch the dashboard
+streamlit run app/dashboard.py
+```
+
+Without a `.env` file, the dashboard still runs -- Overview, Investigations, Models, and Audit Trail all work with no configuration. Only Live Agent needs the two API keys, and it shows a clear message (not a crash) if they're missing.
+
+Optional API layer:
+
+```bash
+uvicorn api.main:app --reload --port 8000
+```
+
+## What's in here
+
+- `data/raw/generate_data.py` — synthetic merchant-snapshot dataset generator (no external data or API keys needed)
+- `features/features.py` — the one shared feature-engineering module used by both training and inference
+- `model/train.py` — trains XGBoost + a logistic-regression baseline, time-based train/val/test split, threshold tuned on validation, metrics + plots saved to `model/artifacts/`
+- `explainability/explain.py` — SHAP-based per-prediction explanations, translated to plain language
+- `gating/decision_engine.py` — the bounding layer: plain rules mapping a score to clear/escalate/flag/manual-review, with a fail-safe path for low-confidence or invalid input. Used by **both** pipelines below — it's the one authority neither the deterministic path nor the agent can bypass.
+- `audit/audit_log.py` — append-only SQLite audit trail, tagged by which pipeline produced each event
+- `pipeline.py` — the deterministic scoring pipeline (used by the dashboard's Investigations page and the API)
+- `agent/` — the agentic layer: `risk_agent.py` (the LLM reasoning loop, via Groq function calling, with a timestamped/timed tool-call trace), `tools.py` (what the agent is allowed to call), `merchant_context.py` (simulated merchant history)
+- `integrations/razorpay_client.py` — real calls to Razorpay's test-mode API (Order creation)
+- `agent_pipeline.py` — the agentic scoring pipeline (Razorpay + agent + gate + audit), used by the Live Agent page
+- `config.py` — loads `GROQ_API_KEY` / `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` from a local `.env` file (see `.env.example`) — never hardcoded, never committed
+- `app/dashboard.py` + `app/theme.py` — the console UI: a native sidebar-navigated app (Overview, Investigations, Live Agent, Models, Audit Trail) with real, interactive (Altair) charts throughout
+- `api/main.py` — optional FastAPI `/score` endpoint
+- `tests/` — 36 tests covering feature engineering, gating logic, the audit log, the deterministic pipeline, and the agent loop (with a scripted fake LLM client so the suite runs offline) (`pytest tests/`)
+
+## What's real vs. simulated
+
+The model, explainability layer, gating logic, and audit trail are fully functional and tested. The base dataset used to train the model is synthetic (generated with a fixed seed for reproducibility) since this project has no access to Razorpay's real transaction/KYC data. In the agentic pipeline, the *transaction* (Order amount, ID, timestamp) is real, live Razorpay test-mode data; the *merchant history* it's paired with is simulated, since no API hands a student project another business's real KYC/chargeback history. See `docs/ARCHITECTURE.md` Sections 11–12 for the full, honest breakdown of what's real vs. simulated and why.
+
+## Security note
+
+`.env` is listed in `.gitignore` and will never be committed. If you ever paste an API key into a chat, a script, or a public repo, treat it as compromised and regenerate it immediately.

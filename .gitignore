@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+audit/audit_log.db
+data/raw/merchant_snapshots.csv
+model/artifacts/*.joblib
+model/artifacts/*.png
+model/artifacts/*.json
+.DS_Store
