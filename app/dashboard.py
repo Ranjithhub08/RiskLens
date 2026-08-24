@@ -20,6 +20,7 @@ Run:
     streamlit run app/dashboard.py
 """
 
+import html
 import json
 import os
 import sys
@@ -30,23 +31,28 @@ import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from agent.risk_agent import summarize_tool_result
 from agent_pipeline import run_agentic_scoring
 from app.theme import (
+    DECISION_STYLE,
     STATUS_ACTIVE,
     STATUS_CONNECTED,
     STATUS_OFFLINE,
     STATUS_ONLINE,
+    agent_recommendation_card_html,
     authority_strip_html,
     case_id_from_event,
     compare_panel_html,
     confusion_matrix_chart,
     decision_badge_html,
     empty_state_html,
+    gate_decision_card_html,
     html_block,
     inject_theme,
     kpi_html,
     model_comparison_table_html,
     order_panel_html,
+    override_banner_html,
     render_sidebar_status,
     render_top_bar,
     risk_activity_chart,
@@ -57,12 +63,14 @@ from app.theme import (
     shap_bars_html,
     shap_global_chart,
     status_row_html,
+    verdict_banner_html,
     workflow_html,
 )
-from audit.audit_log import get_all_events, get_connection
+from audit.audit_log import get_all_events, get_all_overrides, get_connection, get_overrides_for_event, log_override
 from explainability.explain import RiskExplainer
 from features.features import BUSINESS_CATEGORIES
-from gating.decision_engine import GATE_VERSION
+from gating.decision_engine import DECISION_CLEAR, DECISION_ESCALATE, DECISION_FLAG, DECISION_MANUAL_REVIEW, GATE_VERSION
+from model.feedback import promote_candidate, train_candidate_with_feedback
 from pipeline import load_model, score_record
 
 MODEL_PATH = "model/artifacts/xgb_model.joblib"
@@ -270,7 +278,63 @@ def render_case_detail(view: dict):
             """
         )
 
+    render_override_section(view)
+
     st.caption(f"Audit event ID: `{view['event_id']}`")
+
+
+def render_override_section(view: dict):
+    """
+    Lets a human reviewer correct a case's outcome after the fact -- the
+    deterministic gate is authoritative at decision time, but a reviewer who
+    later spots something the gate/agent missed (or a false positive) should
+    be able to say so, on the record. The original decision is never edited;
+    this only ever adds a new human_overrides row (see audit_log.py), so the
+    case detail below always shows both "what the system decided" and "what
+    a human later corrected it to, and why" -- and that correction is exactly
+    the labeled signal a future model retrain would want to learn from.
+    """
+    event_id = view["event_id"]
+    overrides = get_overrides_for_event(conn, event_id)
+    if overrides:
+        html_block(override_banner_html(overrides))
+
+    decision_options = [DECISION_CLEAR, DECISION_ESCALATE, DECISION_FLAG, DECISION_MANUAL_REVIEW]
+    current_decision = overrides[0]["overridden_decision"] if overrides else view["decision"]
+    default_index = decision_options.index(current_decision) if current_decision in decision_options else 0
+
+    with st.expander("Override this decision" if not overrides else "Record another override"):
+        st.caption(
+            "For a reviewer who disagrees with the outcome above after reviewing the full case. "
+            "This doesn't erase or edit the original decision -- it's logged alongside it, and "
+            "becomes labeled feedback future retraining can learn from."
+        )
+        with st.form(key=f"override_form_{event_id}"):
+            new_decision = st.selectbox(
+                "Corrected decision",
+                decision_options,
+                index=default_index,
+                format_func=lambda d: DECISION_STYLE.get(d, {"label": d})["label"],
+                key=f"override_decision_{event_id}",
+            )
+            reason = st.text_area(
+                "Reason for this override", key=f"override_reason_{event_id}",
+                placeholder="e.g. Confirmed with the merchant directly -- the large transaction was a legitimate one-off invoice.",
+            )
+            submitted = st.form_submit_button("Submit override")
+            if submitted:
+                if not reason.strip():
+                    st.error("Please give a reason -- it's what makes this useful as future training signal, not just a status flip.")
+                else:
+                    log_override(
+                        conn,
+                        event_id=event_id,
+                        original_decision=current_decision,
+                        overridden_decision=new_decision,
+                        reason=reason.strip(),
+                    )
+                    st.success("Override recorded.")
+                    st.rerun()
 
 
 # =============================================================================
@@ -539,14 +603,29 @@ def page_live_agent():
     if st.button("Run investigation", type="primary", key="agent_run_btn"):
         result, error_message = None, None
         with st.status("Creating Razorpay test-mode order and running the risk agent...", expanded=True) as status_box:
+            # Live reasoning feed: on_step fires in real time as the agent
+            # investigates, so the reviewer watches it think turn by turn
+            # instead of staring at a spinner until everything is done at once.
+            def _on_step(event, _box=status_box):
+                etype = event.get("type")
+                if etype == "thinking":
+                    _box.write(f"Turn {event['turn']}: agent is deciding its next move...")
+                elif etype == "tool_call":
+                    icon = "Error" if event.get("status") == "error" else "Done"
+                    _box.write(f"[{icon}] `{event['tool']}` -- {event.get('summary', '')}")
+                elif etype == "final":
+                    decision_label = (event.get("decision") or "no proposal").replace("_", " ")
+                    _box.write(f"Agent submitted its recommendation: **{decision_label}**")
+                elif etype == "timeout":
+                    _box.write("Agent did not finish within the allotted turns -- falling back to manual review.")
+
             try:
-                result = run_agentic_scoring(agent_merchant_id, agent_amount, model, explainer, conn)
+                result = run_agentic_scoring(agent_merchant_id, agent_amount, model, explainer, conn, on_step=_on_step)
             except Exception as exc:  # noqa: BLE001 -- surface any failure to the console, don't crash the app
                 error_message = str(exc)
                 status_box.update(label="Investigation failed", state="error")
             else:
                 status_box.write(f"Order created: `{result['razorpay_order_id']}`")
-                status_box.write(f"Agent completed {len(result['trace'])} tool call(s).")
                 status_box.write(f"Gate decision: {result['gated_decision']}")
                 status_box.update(label="Investigation complete", state="complete")
         st.session_state["_last_agent_result"] = result
@@ -560,11 +639,63 @@ def page_live_agent():
 
     if result:
         html_block(workflow_html(AGENT_STEPS, 6))
-        left, center, right = st.columns([1, 1.3, 1.1])
 
-        with left:
-            html_block(
-                f"""
+        # The outcome, shown once, immediately, full-width -- not buried at the
+        # bottom of whichever of several side-by-side columns happens to run
+        # longest (see verdict_banner_html's docstring for why).
+        html_block(verdict_banner_html(result))
+
+        steps_html = []
+        raw_trace_steps_html = []
+        for i, step in enumerate(result["trace"], 1):
+            status = step.get("status", "success")
+            dot_color = "#1E9E5A" if status == "success" else "#D93025"
+            ts = step.get("timestamp")
+            time_label = ts.split("T")[1][:8] if isinstance(ts, str) and "T" in ts else "--:--:--"
+            duration = step.get("duration_ms")
+            duration_label = f" &middot; {duration:.0f}ms" if isinstance(duration, (int, float)) else ""
+            tool = step.get("tool", "unknown")
+            res = step.get("result", {})
+            # Same one-line summary the live on_step feed showed while the
+            # agent was still running -- kept in one place (risk_agent.py)
+            # so the live view and this post-hoc view can never drift apart.
+            detail = summarize_tool_result(tool, res)
+            steps_html.append(
+                f'<div class="rl-tl-step"><div class="rl-tl-rail"><div class="rl-tl-dot" style="background:{dot_color};"></div><div class="rl-tl-line"></div></div>'
+                f'<div class="rl-tl-body"><div class="rl-tl-title">{tool}</div><div class="rl-tl-detail">{detail}</div>'
+                f'<div class="rl-tl-time">{time_label}{duration_label}</div></div></div>'
+            )
+            # st.expander/st.json can't live inside a CSS multi-column masonry
+            # flow (a native Streamlit widget always renders as its own
+            # sibling element, outside any surrounding markdown's HTML -- the
+            # same reason the panel-wrapping bug existed elsewhere in this
+            # app). A plain <details> disclosure with escaped, preformatted
+            # JSON gets the same "click to inspect" behavior without leaving
+            # the masonry grid.
+            step_json = json.dumps({"arguments": step["arguments"], "result": step["result"]}, indent=2, default=str)
+            raw_trace_steps_html.append(
+                f'<div class="rl-details-step"><div class="rl-details-step-title">Step {i}: '
+                f'<code>{html.escape(tool)}</code></div><pre>{html.escape(step_json)}</pre></div>'
+            )
+
+        why_this_score_card = ""
+        if result["explanation"] or result["top_factors"]:
+            why_this_score_card = f"""
+            <div class="rl-panel">
+                <div class="rl-panel-label">Why this score?</div>
+                {shap_bars_html(result["top_factors"])}
+                <p style="margin-top:10px; color:var(--rl-text-dim); font-size:0.85rem;">{result['explanation']}</p>
+            </div>
+            """
+
+        # One continuous HTML fragment, not several separate st.markdown calls --
+        # CSS multi-column layout needs every card as a sibling inside the SAME
+        # container to balance their heights across columns; splitting it across
+        # calls would reintroduce the "div never actually wraps its contents"
+        # bug fixed elsewhere in this app.
+        html_block(
+            f"""
+            <div class="rl-masonry">
                 <div class="rl-panel">
                     <div class="rl-panel-label">Transaction</div>
                     {order_panel_html(result)}
@@ -575,61 +706,15 @@ def page_live_agent():
                         <div><div class="rl-kv-label">Merchant ID</div><div class="rl-kv-value">{result.get('merchant_id') or '—'}</div></div>
                     </div>
                 </div>
-                """
-            )
-
-        with center:
-            steps_html = []
-            for step in result["trace"]:
-                status = step.get("status", "success")
-                dot_color = "#1E9E5A" if status == "success" else "#D93025"
-                ts = step.get("timestamp")
-                time_label = ts.split("T")[1][:8] if isinstance(ts, str) and "T" in ts else "--:--:--"
-                duration = step.get("duration_ms")
-                duration_label = f" &middot; {duration:.0f}ms" if isinstance(duration, (int, float)) else ""
-                tool = step.get("tool", "unknown")
-                res = step.get("result", {})
-                if isinstance(res, dict) and "error" in res:
-                    detail = f"error: {res['error']}"
-                elif tool == "score_transaction_risk":
-                    detail = f"risk_score = {res.get('risk_score'):.4f}" if res.get("risk_score") is not None else "no score returned"
-                elif tool == "explain_transaction_risk":
-                    detail = (res.get("explanation") or "")[:120]
-                elif tool == "get_merchant_context":
-                    detail = f"kyc={res.get('kyc_status')}, age={res.get('account_age_days')}d"
-                elif tool == "get_recent_audit_history":
-                    detail = f"{len(res.get('past_decisions', []))} prior decision(s)"
-                else:
-                    detail = str(res)[:120]
-                steps_html.append(
-                    f'<div class="rl-tl-step"><div class="rl-tl-rail"><div class="rl-tl-dot" style="background:{dot_color};"></div><div class="rl-tl-line"></div></div>'
-                    f'<div class="rl-tl-body"><div class="rl-tl-title">{tool}</div><div class="rl-tl-detail">{detail}</div>'
-                    f'<div class="rl-tl-time">{time_label}{duration_label}</div></div></div>'
-                )
-            html_block(
-                f"""
                 <div class="rl-panel">
                     <div class="rl-panel-label">Agent investigation</div>
                     <div class="rl-timeline">{''.join(steps_html)}</div>
                 </div>
-                """
-            )
-            with st.expander("Raw trace (full tool arguments and results)"):
-                for i, step in enumerate(result["trace"], 1):
-                    st.write(f"**Step {i}: `{step['tool']}`**")
-                    st.json({"arguments": step["arguments"], "result": step["result"]})
-
-        with right:
-            risk_label, risk_color = risk_label_for_score(result["risk_score"])
-            score_display = f"{result['risk_score']:.2f}" if result["risk_score"] is not None else "--"
-            html_block(
-                f"""
                 <div class="rl-panel">
-                    <div class="rl-panel-label">Decision control</div>
-                    <div class="rl-score-row"><span class="rl-score-value">{score_display}</span>
-                        <span class="rl-score-tag" style="color:{risk_color}; background:{risk_color}1A;">{risk_label}</span></div>
-                    {risk_scale_html(result["risk_score"])}
-                    {compare_panel_html(result["agent_proposal"], result["gated_decision"], result["gated_reason"], result["agent_and_gate_agree"])}
+                    {agent_recommendation_card_html(result["agent_proposal"])}
+                </div>
+                <div class="rl-panel">
+                    {gate_decision_card_html(result["gated_decision"], result["gated_reason"])}
                 </div>
                 <div class="rl-panel">
                     <div class="rl-panel-label">Final decision</div>
@@ -637,18 +722,14 @@ def page_live_agent():
                     {authority_strip_html(result["gated_reason"])}
                     <p style="margin-top:12px; font-size:0.8rem; color:var(--rl-text-dim);">&#10003; Verified by deterministic gate &nbsp;&#183;&nbsp; &#10003; Audit event committed</p>
                 </div>
-                """
-            )
-            if result["explanation"] or result["top_factors"]:
-                html_block(
-                    f"""
-                    <div class="rl-panel">
-                        <div class="rl-panel-label">Why this score?</div>
-                        {shap_bars_html(result["top_factors"])}
-                        <p style="margin-top:10px; color:var(--rl-text-dim); font-size:0.85rem;">{result['explanation']}</p>
-                    </div>
-                    """
-                )
+                {why_this_score_card}
+                <details class="rl-details">
+                    <summary>Raw trace (full tool arguments and results)</summary>
+                    {''.join(raw_trace_steps_html)}
+                </details>
+            </div>
+            """
+        )
         st.caption(f"Audit event ID: `{result['event_id']}`")
 
 
@@ -685,6 +766,78 @@ def page_models():
     with st.container(border=True, key="panel_shap_global"):
         html_block('<div class="rl-panel-label">Global feature importance (SHAP, test set)</div>')
         st.altair_chart(shap_global_chart(chart_data["shap_global_importance"]), use_container_width=True)
+
+    render_retrain_from_feedback_section()
+
+
+def render_retrain_from_feedback_section():
+    """
+    Closes the loop the human-override feature opens: a reviewer's
+    corrections (Investigations page) are labeled data sitting in the audit
+    log, and this is where that data actually gets used. Deliberately a
+    two-step, human-gated flow -- "train a candidate and show its impact"
+    is always safe to do on demand, but "replace the live model" only ever
+    happens if a person looks at the before/after numbers here and decides
+    to promote it. Same propose-then-a-human-decides pattern as everywhere
+    else in RiskLens.
+    """
+    st.divider()
+    st.markdown("#### Retrain from feedback")
+
+    overrides = get_all_overrides(conn)
+    if not overrides:
+        html_block(
+            empty_state_html(
+                "No feedback to train on yet",
+                "Once a reviewer overrides a decision on the Investigations page, it shows up here as "
+                "training data. Retraining is always optional and never happens automatically -- this "
+                "section only runs when you click the button below.",
+            )
+        )
+        return
+
+    st.caption(
+        f"{len(overrides)} human override(s) recorded. Training a candidate model never changes what's "
+        "live -- it only happens if you review the numbers below and choose to promote it."
+    )
+
+    if st.button("Train candidate model with feedback", key="train_candidate_btn"):
+        with st.spinner("Retraining a candidate model on the original data plus your feedback..."):
+            try:
+                st.session_state["_retrain_result"] = train_candidate_with_feedback(conn)
+            except Exception as exc:  # noqa: BLE001 -- surface any failure, don't crash the page
+                st.session_state["_retrain_result"] = None
+                st.error(f"Retraining failed: {exc}")
+
+    result = st.session_state.get("_retrain_result")
+    if not result:
+        return
+
+    skipped = result["total_overrides"] - result["feedback_rows_used"]
+    st.caption(
+        f"Trained on {result['combined_rows']} rows: the original training set plus "
+        f"{result['feedback_rows_used']} usable override(s)"
+        + (f" ({skipped} skipped -- incomplete feature data)." if skipped else ".")
+    )
+    html_block(
+        f"""
+        <div class="rl-panel">
+            <div class="rl-panel-label">Candidate (+ feedback) vs. currently deployed</div>
+            {model_comparison_table_html(result["candidate_metrics"], result["current_metrics"], "Candidate (+feedback)", "Current (deployed)")}
+        </div>
+        """
+    )
+
+    candidate_better = result["candidate_metrics"]["f1"] >= result["current_metrics"]["f1"]
+    if not candidate_better:
+        st.caption("The candidate doesn't beat the deployed model's F1 on this test split -- promoting it anyway is your call, not a recommendation.")
+
+    if st.button("Promote candidate to production", key="promote_candidate_btn", type="primary"):
+        promote_candidate(result["candidate_model"], result["candidate_threshold"], result["candidate_metrics"], result["candidate_artifacts"])
+        get_model_and_explainer.clear()  # so the app picks up the new model immediately, not just after a restart
+        st.session_state["_retrain_result"] = None
+        st.success("Candidate promoted -- RiskLens is now scoring with the retrained model.")
+        st.rerun()
 
 
 # =============================================================================
@@ -736,6 +889,34 @@ def page_audit_trail():
             st.json(full_event)
         else:
             st.caption("No events match the current filters.")
+
+    st.divider()
+    st.markdown("#### Human feedback for retraining")
+    overrides = get_all_overrides(conn, limit=1000)
+    if not overrides:
+        html_block(
+            empty_state_html(
+                "No reviewer overrides yet",
+                "When a reviewer corrects a decision (see &ldquo;Override this decision&rdquo; on any case in "
+                "Investigations), it's logged here as labeled feedback &mdash; exactly the kind of signal a future "
+                "model retrain would use to learn from real corrections instead of just the original training data.",
+            )
+        )
+    else:
+        overrides_df = pd.DataFrame(overrides)[
+            ["timestamp_utc", "event_id", "original_decision", "overridden_decision", "reason", "reviewer"]
+        ]
+        st.caption(
+            f"{len(overrides)} reviewer correction(s) recorded so far -- this table is the training signal "
+            "a feedback-driven retrain would use."
+        )
+        st.dataframe(overrides_df, hide_index=True, width="stretch")
+        st.download_button(
+            "Download feedback as CSV",
+            data=overrides_df.to_csv(index=False),
+            file_name="risklens_human_feedback.csv",
+            mime="text/csv",
+        )
 
 
 # =============================================================================

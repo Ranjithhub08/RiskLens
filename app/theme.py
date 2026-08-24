@@ -40,6 +40,7 @@ GREEN = "#1E9E5A"
 AMBER = "#D97C0A"
 ORANGE = "#E0631C"
 RED = "#D93025"
+BLUE = "#2E6FCC"
 
 DECISION_STYLE = {
     DECISION_CLEAR: {"color": GREEN, "bg": "rgba(30,158,90,0.10)", "label": "Clear"},
@@ -160,6 +161,51 @@ div.stVerticalBlock[class*="st-key-panel_"] {{
 }}
 .rl-panel-title {{ font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 1.02rem; color: var(--rl-text); margin-bottom: 2px; }}
 
+/* ---- Live Agent verdict strip: the outcome, shown immediately, full-width,
+   instead of buried at the bottom of the tallest of several side-by-side
+   columns. ---- */
+.rl-verdict-strip {{
+    display: flex; flex-wrap: wrap; align-items: center; gap: 28px;
+    background: var(--rl-surface); border: 1px solid var(--rl-border); border-left: 5px solid var(--rl-border);
+    border-radius: 10px; padding: 18px 24px; margin: 16px 0 4px 0;
+}}
+.rl-verdict-case-label, .rl-verdict-score-value + .rl-verdict-score-tag, .rl-verdict-decision-label {{ font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--rl-text-muted); font-weight: 700; }}
+.rl-verdict-case-label {{ margin-bottom: 3px; }}
+.rl-verdict-case-id {{ font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 1.05rem; color: var(--rl-text); }}
+.rl-verdict-score {{ display: flex; align-items: baseline; gap: 8px; }}
+.rl-verdict-score-value {{ font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 1.9rem; color: var(--rl-text); }}
+.rl-verdict-score-tag {{ font-size: 0.72rem; font-weight: 700; padding: 3px 9px; border-radius: 999px; }}
+.rl-verdict-decision-label {{ margin-bottom: 3px; }}
+.rl-verdict-decision-value {{ font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 1.3rem; }}
+.rl-verdict-note {{ margin-left: auto; text-align: right; font-size: 0.85rem; font-weight: 600; }}
+.rl-verdict-authority {{ margin-top: 3px; font-size: 0.72rem; font-weight: 500; color: var(--rl-text-muted); }}
+@media (max-width: 900px) {{ .rl-verdict-note {{ margin-left: 0; text-align: left; }} }}
+
+/* ---- Balanced masonry grid for the supporting detail cards below the
+   verdict strip. A plain flex/grid row of unequal-height columns leaves the
+   tallest column cascading down alone with empty space beside it (the exact
+   bug this replaced); CSS multi-column layout instead measures total content
+   height up front and distributes it evenly across columns, so no single
+   column ever visibly straggles below the others. break-inside: avoid keeps
+   each card intact rather than splitting one across two columns. ---- */
+.rl-masonry {{ column-count: 3; column-gap: 20px; margin-top: 18px; }}
+.rl-masonry .rl-panel {{ break-inside: avoid; -webkit-column-break-inside: avoid; width: 100%; display: inline-block; }}
+@media (max-width: 1100px) {{ .rl-masonry {{ column-count: 2; }} }}
+@media (max-width: 700px) {{ .rl-masonry {{ column-count: 1; }} }}
+
+/* Native <details> used for the raw trace disclosure inside the masonry grid
+   -- a real Streamlit widget (st.expander) can't live inside a CSS
+   multi-column flow, so this is styled to match .rl-panel exactly. */
+.rl-details {{ background: var(--rl-surface); border: 1px solid var(--rl-border); border-radius: 10px; padding: 16px 20px; margin: 12px 0; break-inside: avoid; }}
+.rl-details summary {{ cursor: pointer; color: var(--rl-text-muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 700; list-style: none; }}
+.rl-details summary::-webkit-details-marker {{ display: none; }}
+.rl-details summary::before {{ content: "▸ "; }}
+.rl-details[open] summary::before {{ content: "▾ "; }}
+.rl-details-step {{ margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--rl-border); }}
+.rl-details-step:first-of-type {{ border-top: none; }}
+.rl-details-step-title {{ font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 0.85rem; color: var(--rl-text); margin-bottom: 6px; }}
+.rl-details pre {{ background: var(--rl-surface-2); border-radius: 6px; padding: 10px 12px; font-size: 0.75rem; color: var(--rl-text-dim); overflow-x: auto; white-space: pre-wrap; word-break: break-word; margin: 0; }}
+
 /* ---- KPI tiles ---- */
 .rl-kpi-row {{ display: flex; gap: 14px; flex-wrap: wrap; margin: 16px 0; }}
 .rl-kpi {{ flex: 1; min-width: 168px; background: var(--rl-surface); border: 1px solid var(--rl-border); border-radius: 10px; padding: 16px 18px; }}
@@ -202,6 +248,12 @@ div.stVerticalBlock[class*="st-key-panel_"] {{
 .rl-authority {{ display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;
     margin-top: 15px; padding-top: 13px; border-top: 1px solid var(--rl-border); font-size: 0.74rem; color: var(--rl-text-muted); }}
 .rl-authority b {{ color: var(--rl-text); font-weight: 700; }}
+
+/* ---- Human override ---- */
+.rl-override-banner {{ margin-top: 14px; padding: 12px 16px; border-radius: 8px; border-left: 4px solid {BLUE};
+    background: rgba(46,111,204,0.07); font-size: 0.82rem; color: var(--rl-text); line-height: 1.5; }}
+.rl-override-banner b {{ color: {BLUE}; }}
+.rl-override-meta {{ margin-top: 5px; font-size: 0.72rem; color: var(--rl-text-muted); }}
 
 /* ---- KV grid ---- */
 .rl-kv-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 13px; }}
@@ -392,6 +444,36 @@ def authority_strip_html(gate_reason: str) -> str:
     """
 
 
+def override_banner_html(overrides: list) -> str:
+    """
+    Shown on a case that a human reviewer has since corrected. The gate's
+    original decision is never erased or edited (see audit_log.OVERRIDES_SCHEMA)
+    -- this banner sits alongside it, making clear a person, not the system,
+    changed the effective outcome, and why. If a case has been overridden more
+    than once, only the most recent correction is the one that currently applies.
+    """
+    if not overrides:
+        return ""
+    latest = overrides[0]  # get_overrides_for_event returns most-recent-first
+    original_style = DECISION_STYLE.get(latest["original_decision"], {"label": latest["original_decision"]})
+    new_style = DECISION_STYLE.get(latest["overridden_decision"], {"label": latest["overridden_decision"]})
+    when = (latest.get("timestamp_utc") or "")[:19].replace("T", " ")
+    reviewer_label = f" by {latest['reviewer']}" if latest.get("reviewer") else ""
+    history_note = (
+        f'<div class="rl-override-meta">{len(overrides)} override(s) recorded for this case &mdash; showing the most recent.</div>'
+        if len(overrides) > 1
+        else ""
+    )
+    return f"""
+    <div class="rl-override-banner">
+        <b>&#9998; Reviewer override{reviewer_label}</b> &mdash; changed from
+        <b>{original_style['label']}</b> to <b>{new_style['label']}</b>.
+        <div class="rl-override-meta">&ldquo;{latest['reason']}&rdquo; &nbsp;&#183;&nbsp; {when} UTC</div>
+        {history_note}
+    </div>
+    """
+
+
 _FACTOR_LABELS = {
     "account_age_days": "Account age",
     "kyc_complete": "KYC status",
@@ -428,34 +510,103 @@ def shap_bars_html(top_factors: list) -> str:
     return "".join(rows)
 
 
-def compare_panel_html(agent_proposal, gated_decision, gate_reason, agree) -> str:
-    agent_decision = (agent_proposal or {}).get("recommended_decision")
-    agent_style = DECISION_STYLE.get(agent_decision, {"color": TEXT_MUTED, "label": (agent_decision or "No proposal")})
-    gate_style = DECISION_STYLE.get(gated_decision, {"color": TEXT_MUTED, "label": gated_decision})
-
+def _agreement_banner_html(agent_proposal, gate_style, agree) -> str:
     if agree is True:
-        banner = f'<div class="rl-verdict-banner" style="background:rgba(30,158,90,0.08); color:{GREEN};">&#10003; Agreement &mdash; the agent\'s recommendation matches the deterministic gate.</div>'
-    elif agree is False:
-        banner = (
+        return f'<div class="rl-verdict-banner" style="background:rgba(30,158,90,0.08); color:{GREEN};">&#10003; Agreement &mdash; the agent\'s recommendation matches the deterministic gate.</div>'
+    if agree is False:
+        return (
             f'<div class="rl-verdict-banner" style="background:rgba(217,48,37,0.08); color:{RED};">'
             f"&#9888; Gate override &mdash; the gate did not accept the agent's recommendation. "
             f"Final decision: <b>{gate_style['label']}</b>, authority: {GATE_VERSION}.</div>"
         )
-    else:
-        banner = f'<div class="rl-verdict-banner" style="background:rgba(152,160,168,0.08); color:{TEXT_MUTED};">No comparable agent proposal was produced &mdash; the gate decision stands alone.</div>'
+    return f'<div class="rl-verdict-banner" style="background:rgba(152,160,168,0.08); color:{TEXT_MUTED};">No comparable agent proposal was produced &mdash; the gate decision stands alone.</div>'
 
+
+def agent_recommendation_card_html(agent_proposal) -> str:
+    """Just the AI-side half of the comparison, as its own standalone card --
+    used where compare_panel_html's combined block would be too large a
+    single unit for a balanced layout (e.g. a CSS masonry grid)."""
+    agent_decision = (agent_proposal or {}).get("recommended_decision")
+    agent_style = DECISION_STYLE.get(agent_decision, {"color": TEXT_MUTED, "label": (agent_decision or "No proposal")})
     return f"""
     <div class="rl-compare-col">
         <div class="rl-compare-title">AI agent recommendation</div>
         <div class="rl-compare-decision" style="color:{agent_style['color']};">{agent_style['label']}</div>
         <div class="rl-compare-sub">{(agent_proposal or {}).get('reasoning', 'No reasoning returned.')}</div>
     </div>
+    """
+
+
+def gate_decision_card_html(gated_decision, gate_reason) -> str:
+    """The gate-side half of the comparison, as its own standalone card -- see
+    agent_recommendation_card_html."""
+    gate_style = DECISION_STYLE.get(gated_decision, {"color": TEXT_MUTED, "label": gated_decision})
+    return f"""
     <div class="rl-compare-col">
         <div class="rl-compare-title">Deterministic gate &middot; {GATE_VERSION}</div>
         <div class="rl-compare-decision" style="color:{gate_style['color']};">{gate_style['label']}</div>
         <div class="rl-compare-sub">{gate_reason}</div>
     </div>
-    {banner}
+    """
+
+
+def compare_panel_html(agent_proposal, gated_decision, gate_reason, agree) -> str:
+    gate_style = DECISION_STYLE.get(gated_decision, {"color": TEXT_MUTED, "label": gated_decision})
+    banner = _agreement_banner_html(agent_proposal, gate_style, agree)
+    return (
+        agent_recommendation_card_html(agent_proposal)
+        + gate_decision_card_html(gated_decision, gate_reason)
+        + banner
+    )
+
+
+def verdict_banner_html(result: dict) -> str:
+    """
+    The Live Agent's outcome, shown once, full-width, immediately after the
+    workflow tracker -- instead of only appearing at the bottom of whichever
+    of three side-by-side columns happens to be tallest. Reuses the same
+    agree/override language as compare_panel_html so the two never disagree
+    with each other on the same page.
+    """
+    score = result.get("risk_score")
+    risk_label, risk_color = risk_label_for_score(score)
+    score_display = f"{score:.2f}" if score is not None else "--"
+
+    gated_decision = result.get("gated_decision")
+    gate_style = DECISION_STYLE.get(gated_decision, {"color": TEXT_MUTED, "label": gated_decision or "—"})
+    agree = result.get("agent_and_gate_agree")
+    agent_label = DECISION_STYLE.get(
+        (result.get("agent_proposal") or {}).get("recommended_decision"), {}
+    ).get("label", "no proposal")
+
+    if agree is True:
+        note = f'<span style="color:{GREEN};">&#10003; Agent and gate agree</span>'
+    elif agree is False:
+        note = f'<span style="color:{RED};">&#9888; Gate overrode the agent\'s &ldquo;{agent_label}&rdquo; recommendation</span>'
+    else:
+        note = f'<span style="color:{TEXT_MUTED};">No comparable agent proposal was produced</span>'
+
+    case_id = case_id_from_event(result.get("event_id")) if result.get("event_id") else "—"
+
+    return f"""
+    <div class="rl-verdict-strip" style="border-left-color:{gate_style['color']};">
+        <div>
+            <div class="rl-verdict-case-label">Case</div>
+            <div class="rl-verdict-case-id">{case_id}</div>
+        </div>
+        <div class="rl-verdict-score">
+            <div class="rl-verdict-score-value">{score_display}</div>
+            <div class="rl-verdict-score-tag" style="color:{risk_color}; background:{risk_color}1A;">{risk_label}</div>
+        </div>
+        <div>
+            <div class="rl-verdict-decision-label">Final decision</div>
+            <div class="rl-verdict-decision-value" style="color:{gate_style['color']};">{gate_style['label']}</div>
+        </div>
+        <div class="rl-verdict-note">
+            {note}
+            <div class="rl-verdict-authority">Final authority: {GATE_VERSION}</div>
+        </div>
+    </div>
     """
 
 
@@ -634,7 +785,7 @@ def risk_distribution_chart(counts: dict):
     return chart
 
 
-def model_comparison_table_html(xgb: dict, base: dict) -> str:
+def model_comparison_table_html(xgb: dict, base: dict, left_label: str = "XGBoost", right_label: str = "Logistic Regression") -> str:
     rows = [
         ("Precision", xgb["precision"], base["precision"]),
         ("Recall", xgb["recall"], base["recall"]),
@@ -652,8 +803,8 @@ def model_comparison_table_html(xgb: dict, base: dict) -> str:
     <table style="width:100%; border-collapse:collapse; font-size:0.86rem;">
         <thead><tr>
             <th style="text-align:left; padding:0 14px 8px 0; color:var(--rl-text-muted); font-size:0.68rem; text-transform:uppercase; letter-spacing:0.05em;">Metric</th>
-            <th style="text-align:right; padding:0 14px 8px; color:var(--rl-text-muted); font-size:0.68rem; text-transform:uppercase; letter-spacing:0.05em;">XGBoost</th>
-            <th style="text-align:right; padding:0 0 8px 14px; color:var(--rl-text-muted); font-size:0.68rem; text-transform:uppercase; letter-spacing:0.05em;">Logistic Regression</th>
+            <th style="text-align:right; padding:0 14px 8px; color:var(--rl-text-muted); font-size:0.68rem; text-transform:uppercase; letter-spacing:0.05em;">{left_label}</th>
+            <th style="text-align:right; padding:0 0 8px 14px; color:var(--rl-text-muted); font-size:0.68rem; text-transform:uppercase; letter-spacing:0.05em;">{right_label}</th>
         </tr></thead>
         <tbody>{body_rows}</tbody>
     </table>

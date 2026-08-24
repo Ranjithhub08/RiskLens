@@ -1,0 +1,255 @@
+"""
+Turns human overrides (audit/audit_log.py's human_overrides table) into
+training data, and retrains a CANDIDATE model on the original training set
+plus that feedback -- without silently replacing the live production model.
+
+This deliberately mirrors the "propose, then a human decides" pattern used
+everywhere else in RiskLens: the agent proposes a decision and the
+deterministic gate is what actually decides; here, a retrain proposes a
+candidate model and its measured before/after impact, and a human reviewer
+explicitly promotes it (see promote_candidate) only if the numbers look
+better. Retraining always happens on demand; promoting to production is a
+separate, deliberate, auditable step.
+"""
+
+import json
+import os
+
+import joblib
+import numpy as np
+import pandas as pd
+import shap
+from sklearn.metrics import confusion_matrix, roc_curve
+from xgboost import XGBClassifier
+
+from audit.audit_log import get_all_overrides, get_event_by_id
+from features.features import RAW_REQUIRED_COLUMNS, transform_features
+from gating.decision_engine import DECISION_CLEAR
+from model.train import (
+    RAW_DATA_PATH,
+    TRAIN_FRACTION,
+    VAL_FRACTION,
+    best_threshold_for_f1,
+    evaluate,
+)
+
+ARTIFACT_DIR = "model/artifacts"
+MODEL_PATH = os.path.join(ARTIFACT_DIR, "xgb_model.joblib")
+THRESHOLD_PATH = os.path.join(ARTIFACT_DIR, "decision_threshold.json")
+METRICS_PATH = os.path.join(ARTIFACT_DIR, "metrics.json")
+CHART_DATA_PATH = os.path.join(ARTIFACT_DIR, "chart_data.json")
+
+
+def _extract_features_from_event(event: dict) -> dict:
+    """
+    Pull a full raw feature row (same shape as data/raw/merchant_snapshots.csv)
+    out of a logged audit event, regardless of which pipeline produced it.
+
+    rule_pipeline events store the complete record directly in input_snapshot.
+    agent_pipeline events only store the transaction (merchant_id, amount) in
+    input_snapshot -- the rest of the merchant profile was fetched live during
+    the investigation and only appears inside agent_trace's get_merchant_context
+    tool result, so we look there instead.
+    """
+    snapshot = event.get("input_snapshot")
+    if isinstance(snapshot, str):
+        try:
+            snapshot = json.loads(snapshot)
+        except (TypeError, json.JSONDecodeError):
+            snapshot = {}
+    snapshot = snapshot or {}
+
+    source = event.get("source") or "rule_pipeline"
+    row = {"merchant_id": event.get("merchant_id")}
+
+    if source == "rule_pipeline":
+        for col in RAW_REQUIRED_COLUMNS:
+            row[col] = snapshot.get(col)
+        return row
+
+    row["daily_txn_volume"] = (snapshot.get("transaction") or {}).get("daily_txn_volume")
+    agent_trace = event.get("agent_trace")
+    if isinstance(agent_trace, str):
+        try:
+            agent_trace = json.loads(agent_trace)
+        except (TypeError, json.JSONDecodeError):
+            agent_trace = None
+    for step in agent_trace or []:
+        if step.get("tool") == "get_merchant_context" and isinstance(step.get("result"), dict):
+            ctx = step["result"]
+            for col in RAW_REQUIRED_COLUMNS:
+                if col != "daily_txn_volume":
+                    row[col] = ctx.get(col)
+            break
+    return row
+
+
+def build_feedback_rows(conn) -> pd.DataFrame:
+    """
+    One row per human override, in the exact schema model/train.py expects --
+    ready to append onto the original training data for a retrain.
+
+    Label mapping: a reviewer correcting a case to "clear" is a ground-truth
+    NOT-risky example (is_risky=0); correcting it to anything else (escalate,
+    flag_for_compliance_review, needs_manual_review) is a ground-truth risky
+    example (is_risky=1). This collapses RiskLens's 4-way decision into the
+    model's binary target -- the same simplification the deterministic gate
+    already makes by thresholding a single risk probability.
+
+    Overrides whose original event can't be found, or whose feature row is
+    incomplete (e.g. an agent case where get_merchant_context was never
+    called), are skipped rather than guessed at -- see skipped_count on the
+    caller side if you need to report how many were dropped.
+    """
+    rows = []
+    for override in get_all_overrides(conn):
+        event = get_event_by_id(conn, override["event_id"])
+        if not event:
+            continue
+        features = _extract_features_from_event(event)
+        if any(features.get(col) is None for col in RAW_REQUIRED_COLUMNS):
+            continue
+        features["is_risky"] = 0 if override["overridden_decision"] == DECISION_CLEAR else 1
+        features["snapshot_date"] = override["timestamp_utc"]
+        rows.append(features)
+    return pd.DataFrame(rows)
+
+
+def train_candidate_with_feedback(conn) -> dict:
+    """
+    Retrains on the ORIGINAL raw training data plus every usable human
+    override collected so far, and returns metrics for both the
+    currently-deployed model and this new candidate evaluated on the SAME
+    held-out test split, so the comparison is apples-to-apples. Never
+    touches the live model file -- see promote_candidate for that.
+    """
+    original_df = pd.read_csv(RAW_DATA_PATH, parse_dates=["snapshot_date"])
+    feedback_df = build_feedback_rows(conn)
+    total_overrides = len(get_all_overrides(conn))
+
+    if not feedback_df.empty:
+        feedback_df["snapshot_date"] = pd.to_datetime(feedback_df["snapshot_date"], utc=True).dt.tz_localize(None)
+        combined_df = pd.concat([original_df, feedback_df], ignore_index=True, sort=False)
+    else:
+        combined_df = original_df
+    combined_df = combined_df.sort_values("snapshot_date").reset_index(drop=True)
+
+    n = len(combined_df)
+    train_end = int(n * TRAIN_FRACTION)
+    val_end = int(n * (TRAIN_FRACTION + VAL_FRACTION))
+    train_df = combined_df.iloc[:train_end]
+    val_df = combined_df.iloc[train_end:val_end]
+    test_df = combined_df.iloc[val_end:]
+
+    X_train, y_train = transform_features(train_df), train_df["is_risky"].values
+    X_val, y_val = transform_features(val_df), val_df["is_risky"].values
+    X_test, y_test = transform_features(test_df), test_df["is_risky"].values
+
+    # Currently-deployed model, scored on this SAME test split.
+    current_model = joblib.load(MODEL_PATH)
+    current_threshold = 0.5
+    if os.path.exists(THRESHOLD_PATH):
+        with open(THRESHOLD_PATH) as f:
+            current_threshold = json.load(f).get("xgboost_threshold", 0.5)
+    current_prob = current_model.predict_proba(X_test)[:, 1]
+    current_metrics = evaluate("current (deployed)", y_test, current_prob, current_threshold)
+
+    # Candidate: same hyperparameters model/train.py uses, trained on the
+    # combined (original + feedback) data.
+    n_pos = y_train.sum()
+    n_neg = len(y_train) - n_pos
+    candidate = XGBClassifier(
+        n_estimators=500,
+        max_depth=3,
+        learning_rate=0.03,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=5,
+        reg_lambda=2.0,
+        scale_pos_weight=n_neg / max(n_pos, 1),
+        eval_metric="aucpr",
+        early_stopping_rounds=30,
+        random_state=42,
+    )
+    candidate.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+    candidate_threshold = best_threshold_for_f1(y_val, candidate.predict_proba(X_val)[:, 1])
+    candidate_prob = candidate.predict_proba(X_test)[:, 1]
+    candidate_metrics = evaluate("candidate (with feedback)", y_test, candidate_prob, candidate_threshold)
+
+    # Precomputed here (not inside promote_candidate) so promoting is just a
+    # file write, not a second round of training/SHAP work -- everything a
+    # promotion needs to keep the Models page's charts in sync with whatever
+    # actually gets deployed is captured from the SAME candidate fit above.
+    y_pred = (candidate_prob >= candidate_threshold).astype(int)
+    cm = confusion_matrix(y_test, y_pred)
+    fpr, tpr, _ = roc_curve(y_test, candidate_prob)
+    shap_values = shap.TreeExplainer(candidate).shap_values(X_test)
+    mean_abs_shap = np.abs(shap_values).mean(axis=0)
+    shap_global = sorted(
+        (
+            {"feature": name, "mean_abs_shap": float(val)}
+            for name, val in zip(X_test.columns.tolist(), mean_abs_shap)
+        ),
+        key=lambda d: d["mean_abs_shap"],
+        reverse=True,
+    )
+
+    return {
+        "total_overrides": total_overrides,
+        "feedback_rows_used": len(feedback_df),
+        "combined_rows": n,
+        "current_metrics": current_metrics,
+        "candidate_metrics": candidate_metrics,
+        "candidate_model": candidate,
+        "candidate_threshold": candidate_threshold,
+        "candidate_artifacts": {
+            "test_rows": len(X_test),
+            "test_positive_rate": float(y_test.mean()),
+            "confusion_matrix": cm.tolist(),
+            "roc_curve": {"fpr": fpr.tolist(), "tpr": tpr.tolist(), "auc": candidate_metrics["roc_auc"]},
+            "shap_global_importance": shap_global,
+        },
+    }
+
+
+def promote_candidate(candidate_model, candidate_threshold: float, candidate_metrics: dict, candidate_artifacts: dict) -> None:
+    """
+    Explicit, human-triggered step: overwrite the live model + threshold
+    with a candidate that's already been reviewed, AND refresh the Models
+    page's own metrics.json/chart_data.json to match -- otherwise the page
+    would keep showing the old model's confusion matrix/ROC/SHAP chart right
+    after promoting a model that no longer produces them, which reads as a
+    bug even though it's actually cosmetic staleness. The baseline logistic
+    regression comparison is left untouched since it wasn't retrained here;
+    only the XGBoost side of the report changes.
+
+    Deliberately separate from training the candidate -- retraining always
+    happens on demand, promoting only happens if a person looks at the
+    before/after numbers and decides it's actually better.
+    """
+    os.makedirs(ARTIFACT_DIR, exist_ok=True)
+    joblib.dump(candidate_model, MODEL_PATH)
+    with open(THRESHOLD_PATH, "w") as f:
+        json.dump({"xgboost_threshold": candidate_threshold}, f, indent=2)
+
+    metrics_report = {}
+    if os.path.exists(METRICS_PATH):
+        with open(METRICS_PATH) as f:
+            metrics_report = json.load(f)
+    metrics_report["test_rows"] = candidate_artifacts["test_rows"]
+    metrics_report["test_positive_rate"] = candidate_artifacts["test_positive_rate"]
+    metrics_report["xgboost"] = candidate_metrics
+    if "baseline_logistic_regression" in metrics_report:
+        metrics_report["lift_over_baseline_f1"] = candidate_metrics["f1"] - metrics_report["baseline_logistic_regression"]["f1"]
+    with open(METRICS_PATH, "w") as f:
+        json.dump(metrics_report, f, indent=2)
+
+    chart_data = {}
+    if os.path.exists(CHART_DATA_PATH):
+        with open(CHART_DATA_PATH) as f:
+            chart_data = json.load(f)
+    chart_data["confusion_matrix"] = {"labels": ["Not risky", "Risky"], "matrix": candidate_artifacts["confusion_matrix"]}
+    chart_data.setdefault("roc_curve", {})["xgboost"] = candidate_artifacts["roc_curve"]
+    chart_data["shap_global_importance"] = candidate_artifacts["shap_global_importance"]
+    with open(CHART_DATA_PATH, "w") as f:
+        json.dump(chart_data, f, indent=2)

@@ -1,0 +1,21 @@
+# Pins Streamlit's own theme engine to light mode, explicitly.
+#
+# Without this file, Streamlit's default theme is "auto" -- it follows
+# whatever dark/light mode your OS or browser is set to. Our custom CSS in
+# app/theme.py styles RiskLens's own elements (panels, badges, the sidebar)
+# to always look light, but it can't reach Streamlit's NATIVE widgets --
+# selectbox/multiselect dropdown menus, the st.dataframe grid, st.status --
+# those are rendered by Streamlit itself from its own theme tokens, and if
+# your system is in dark mode, Streamlit renders them dark regardless of
+# what our page CSS says. That's the exact "light everywhere except the
+# dropdowns and the table" split seen in testing.
+#
+# Setting base = "light" here stops Streamlit from auto-following the OS at
+# all, and the colors below match RiskLens's own palette (see app/theme.py)
+# so the native widgets and our custom ones look like one consistent app.
+[theme]
+base = "light"
+primaryColor = "#E53935"
+backgroundColor = "#F7F8FA"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#17191C"

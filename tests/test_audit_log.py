@@ -3,7 +3,15 @@ import tempfile
 
 import pytest
 
-from audit.audit_log import get_all_events, get_connection, get_events_for_merchant, log_event
+from audit.audit_log import (
+    get_all_events,
+    get_all_overrides,
+    get_connection,
+    get_events_for_merchant,
+    get_overrides_for_event,
+    log_event,
+    log_override,
+)
 
 
 @pytest.fixture
@@ -73,3 +81,51 @@ def test_multiple_events_ordered_most_recent_first(temp_conn):
     assert len(events) == 2
     # most recent first
     assert events[0]["input_snapshot"] == '{"a": 2}'
+
+
+def test_log_override_does_not_touch_the_original_event(temp_conn):
+    """
+    A human override must never mutate the original decision -- it's a
+    separate, additional record layered on top (see audit_log.py's
+    OVERRIDES_SCHEMA docstring for why). This is the test that would fail
+    first if someone "simplified" log_override into an UPDATE statement.
+    """
+    event_id = log_event(temp_conn, "M1", {"a": 1}, 0.85, None, "explanation", "flag_for_compliance_review", "high risk")
+    original_event = get_all_events(temp_conn)[0]
+
+    log_override(
+        temp_conn, event_id=event_id, original_decision="flag_for_compliance_review",
+        overridden_decision="clear", reason="Confirmed legitimate with the merchant directly.",
+    )
+
+    # The original audit_events row is byte-for-byte unchanged.
+    unchanged_event = get_all_events(temp_conn)[0]
+    assert unchanged_event == original_event
+    assert unchanged_event["decision"] == "flag_for_compliance_review"
+
+
+def test_get_overrides_for_event_filters_and_orders_correctly(temp_conn):
+    event_id = log_event(temp_conn, "M1", {"a": 1}, 0.85, None, "e", "escalate", "r")
+    other_event_id = log_event(temp_conn, "M2", {"a": 2}, 0.85, None, "e", "escalate", "r")
+    log_override(temp_conn, event_id, "escalate", "clear", "first correction")
+    log_override(temp_conn, event_id, "clear", "flag_for_compliance_review", "second correction, reviewer changed their mind")
+    log_override(temp_conn, other_event_id, "escalate", "clear", "unrelated case's override")
+
+    overrides = get_overrides_for_event(temp_conn, event_id)
+    assert len(overrides) == 2
+    assert all(o["event_id"] == event_id for o in overrides)
+    # Most recent first.
+    assert overrides[0]["reason"] == "second correction, reviewer changed their mind"
+    assert overrides[0]["original_decision"] == "clear"
+    assert overrides[0]["overridden_decision"] == "flag_for_compliance_review"
+
+
+def test_get_all_overrides_returns_every_override(temp_conn):
+    e1 = log_event(temp_conn, "M1", {"a": 1}, 0.85, None, "e", "escalate", "r")
+    e2 = log_event(temp_conn, "M2", {"a": 2}, 0.2, None, "e", "clear", "r")
+    log_override(temp_conn, e1, "escalate", "clear", "reason 1")
+    log_override(temp_conn, e2, "clear", "escalate", "reason 2")
+
+    all_overrides = get_all_overrides(temp_conn)
+    assert len(all_overrides) == 2
+    assert {o["event_id"] for o in all_overrides} == {e1, e2}

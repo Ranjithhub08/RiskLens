@@ -16,12 +16,15 @@ from audit.audit_log import log_event
 from integrations.razorpay_client import create_test_order, order_to_transaction_fields
 
 
-def run_agentic_scoring(merchant_id: str, amount_rupees: float, model, explainer, conn, groq_client=None) -> dict:
+def run_agentic_scoring(merchant_id: str, amount_rupees: float, model, explainer, conn, groq_client=None, on_step=None) -> dict:
     """
     Creates a real Razorpay test-mode order for the given amount, then runs
     the risk agent over it (merchant_id ties the live order to a simulated
     merchant history -- see agent/merchant_context.py), and logs the full
     result including the agent's reasoning trace.
+
+    on_step: optional callback forwarded straight to run_risk_agent, so a UI
+    can render the investigation live as it happens (see risk_agent.py).
     """
     order = create_test_order(amount_rupees, merchant_id)
     txn_fields = order_to_transaction_fields(order)
@@ -33,7 +36,7 @@ def run_agentic_scoring(merchant_id: str, amount_rupees: float, model, explainer
         "razorpay_order_id": txn_fields["razorpay_order_id"],
     }
 
-    agent_result = run_risk_agent(transaction, tools, groq_client=groq_client)
+    agent_result = run_risk_agent(transaction, tools, groq_client=groq_client, on_step=on_step)
 
     event_id = log_event(
         conn,

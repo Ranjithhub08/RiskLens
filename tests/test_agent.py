@@ -14,9 +14,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent.merchant_context import get_merchant_context
 from agent.risk_agent import run_risk_agent
 from agent.tools import RiskAgentTools
-from audit.audit_log import get_connection
+from audit.audit_log import get_connection, log_event
 from explainability.explain import RiskExplainer
 from pipeline import load_model
 
@@ -158,6 +159,156 @@ def test_running_out_of_turns_fails_safe_to_manual_review(tools):
 
     assert result["risk_score"] is None
     assert result["gated_decision"] == "needs_manual_review"
+
+
+def test_final_answer_via_submit_decision_tool_call(tools):
+    """
+    Groq's real tool-use models -- unlike our scripted fake client in every other
+    test here -- tend to submit structured final output as an actual tool call
+    rather than plain text, even when asked to reply with bare JSON. Before
+    submit_decision existed as a real, declared tool, the model would invent an
+    undeclared one (observed in production: a call to a tool literally named
+    "json"), which the Groq API rejects outright with a 400 tool-validation
+    error and the whole investigation would fail. This test locks in the fix:
+    a final answer delivered via submit_decision must parse exactly like one
+    delivered as plain-text JSON used to.
+    """
+    scripted = ScriptedGroqClient(
+        [
+            _response(_tool_message([_tool_call("1", "get_merchant_context", {"merchant_id": "AGT6"})])),
+            _response(_tool_message([_tool_call("2", "score_transaction_risk", MERCHANT_ARGS)])),
+            _response(_tool_message([_tool_call("3", "explain_transaction_risk", MERCHANT_ARGS)])),
+            _response(
+                _tool_message(
+                    [_tool_call("4", "submit_decision", {"recommended_decision": "clear", "reasoning": "Low risk."})]
+                )
+            ),
+        ]
+    )
+    result = run_risk_agent({"merchant_id": "AGT6", "daily_txn_volume": 9000}, tools, groq_client=scripted)
+
+    assert result["risk_score"] is not None
+    # Only the three real investigative calls should land in the trace --
+    # submit_decision itself isn't a RiskLens tool and shouldn't appear there.
+    assert len(result["trace"]) == 3
+    assert result["agent_proposal"] == {"recommended_decision": "clear", "reasoning": "Low risk."}
+    assert result["gated_decision"] in {"clear", "escalate", "flag_for_compliance_review", "needs_manual_review"}
+
+
+def test_on_step_callback_fires_live_progress_events(tools):
+    """
+    The Live Agent page's "watch it think" feed depends on on_step firing in
+    real time as the investigation proceeds, not just once at the very end.
+    This locks in the event sequence a UI can rely on: one "thinking" event
+    per model call, one "tool_call" event per REAL tool dispatched (submit_decision
+    itself must not produce one, matching how it's excluded from result["trace"]),
+    and exactly one "final" event carrying the agent's proposed decision.
+    """
+    scripted = ScriptedGroqClient(
+        [
+            _response(_tool_message([_tool_call("1", "get_merchant_context", {"merchant_id": "AGT7"})])),
+            _response(_tool_message([_tool_call("2", "score_transaction_risk", MERCHANT_ARGS)])),
+            _response(_tool_message([_tool_call("3", "explain_transaction_risk", MERCHANT_ARGS)])),
+            _response(
+                _tool_message(
+                    [_tool_call("4", "submit_decision", {"recommended_decision": "clear", "reasoning": "Low risk."})]
+                )
+            ),
+        ]
+    )
+    events = []
+    result = run_risk_agent(
+        {"merchant_id": "AGT7", "daily_txn_volume": 9000}, tools, groq_client=scripted, on_step=events.append
+    )
+
+    thinking_events = [e for e in events if e["type"] == "thinking"]
+    tool_call_events = [e for e in events if e["type"] == "tool_call"]
+    final_events = [e for e in events if e["type"] == "final"]
+
+    assert len(thinking_events) == 4  # one per model call, including the submit_decision turn
+    assert [e["tool"] for e in tool_call_events] == [
+        "get_merchant_context",
+        "score_transaction_risk",
+        "explain_transaction_risk",
+    ]
+    assert all(e["status"] == "success" for e in tool_call_events)
+    assert len(final_events) == 1
+    assert final_events[0]["decision"] == "clear"
+    assert final_events[0]["gated_decision"] == result["gated_decision"]
+
+
+def test_get_similar_past_cases_prioritizes_same_business_category(tools):
+    """
+    get_similar_past_cases is cross-merchant precedent, not this merchant's
+    own history (that's get_recent_audit_history's job) -- so this locks in
+    three things: the subject merchant's own past event must never come
+    back, a past case in the SAME business category must outrank one in a
+    different category, and the reported category must match what
+    merchant_context.py would derive for the subject merchant.
+    """
+    subject_id = "SIM-SUBJECT"
+    subject_category = get_merchant_context(subject_id)["business_category"]
+
+    # business_category is deterministic per merchant_id (seeded hash), not
+    # something a test can assign directly -- so scan for one candidate that
+    # lands in the same category and one that doesn't.
+    same_category_id, other_category_id = None, None
+    for i in range(500):
+        candidate = f"SIM-CANDIDATE-{i}"
+        category = get_merchant_context(candidate)["business_category"]
+        if category == subject_category and same_category_id is None:
+            same_category_id = candidate
+        elif category != subject_category and other_category_id is None:
+            other_category_id = candidate
+        if same_category_id and other_category_id:
+            break
+    assert same_category_id and other_category_id  # sanity: more than one category exists
+
+    log_event(
+        tools.conn, merchant_id=same_category_id, input_snapshot={}, risk_score=0.2,
+        top_factors=None, explanation="Same-category past case.", decision="clear", decision_reason="ok",
+    )
+    log_event(
+        tools.conn, merchant_id=other_category_id, input_snapshot={}, risk_score=0.9,
+        top_factors=None, explanation="Other-category past case.", decision="flag_for_compliance_review", decision_reason="risky",
+    )
+    log_event(
+        tools.conn, merchant_id=subject_id, input_snapshot={}, risk_score=0.5,
+        top_factors=None, explanation="Subject's own past case.", decision="escalate", decision_reason="own history",
+    )
+
+    result = tools.get_similar_past_cases(subject_id)
+
+    returned_ids = [c["merchant_id"] for c in result["similar_cases"]]
+    assert subject_id not in returned_ids
+    assert same_category_id in returned_ids
+    assert returned_ids.index(same_category_id) < returned_ids.index(other_category_id)
+    assert result["current_business_category"] == subject_category
+
+
+def test_agent_can_call_get_similar_past_cases_tool(tools):
+    scripted = ScriptedGroqClient(
+        [
+            _response(_tool_message([_tool_call("1", "get_merchant_context", {"merchant_id": "AGT8"})])),
+            _response(_tool_message([_tool_call("2", "score_transaction_risk", MERCHANT_ARGS)])),
+            _response(_tool_message([_tool_call("3", "explain_transaction_risk", MERCHANT_ARGS)])),
+            _response(_tool_message([_tool_call("4", "get_similar_past_cases", {"merchant_id": "AGT8"})])),
+            _response(
+                _tool_message(
+                    [_tool_call(
+                        "5", "submit_decision",
+                        {"recommended_decision": "clear", "reasoning": "Low risk, consistent with precedent."},
+                    )]
+                )
+            ),
+        ]
+    )
+    result = run_risk_agent({"merchant_id": "AGT8", "daily_txn_volume": 9000}, tools, groq_client=scripted)
+
+    assert result["risk_score"] is not None
+    assert len(result["trace"]) == 4
+    assert result["trace"][3]["tool"] == "get_similar_past_cases"
+    assert "similar_cases" in result["trace"][3]["result"]
 
 
 def test_tool_error_is_captured_not_raised(tools):
