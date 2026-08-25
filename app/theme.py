@@ -11,6 +11,7 @@ computed result -- nothing in this module invents data for visual effect.
 """
 
 import html
+import math
 
 import altair as alt
 import pandas as pd
@@ -396,7 +397,15 @@ def decision_badge_html(decision: str) -> str:
 
 
 def risk_label_for_score(score):
-    if score is None:
+    # gating/decision_engine.decide_from_score treats a NaN/inf score the
+    # same as a missing one (routed to needs_manual_review with an honest
+    # reason, not silently compared against a threshold) -- this display
+    # function used to only guard against None, so every comparison below
+    # being False for NaN meant a NaN score fell through to the final
+    # `return "High risk"` branch. A case the gate correctly flagged as
+    # "couldn't be scored" would then visually present to a reviewer as
+    # confirmed maximum risk instead of unscored.
+    if score is None or not math.isfinite(score):
         return "Unscored", TEXT_MUTED
     if score < ESCALATE_THRESHOLD:
         return "Low risk", GREEN
@@ -422,7 +431,12 @@ def case_id_from_event(event_id) -> str:
 
 
 def risk_scale_html(score) -> str:
-    if score is None:
+    # Same NaN/inf guard as risk_label_for_score: min(1.0, float('nan'))
+    # returns 1.0 in Python, so without this check a NaN score used to draw
+    # the marker at the far right of the scale (100%, "maximum risk") --
+    # the visual opposite of the gate's own "couldn't be scored, needs
+    # manual review" outcome for that same NaN score.
+    if score is None or not math.isfinite(score):
         marker = ""
     else:
         pct = round(max(0.0, min(1.0, score)) * 100, 2)
