@@ -638,7 +638,14 @@ def page_investigations():
             result = score_record(record, model, explainer, conn)
             html_block(workflow_html(INVESTIGATION_STEPS, 6 if result["risk_score"] is not None else 4))
             st.success(f"Case #{case_id_from_event(result['event_id'])} scored -- see it in the Case table tab.")
-            st.session_state["_last_case_event_id"] = result["event_id"]
+            # Jump the Case table's search box straight to this new case, so
+            # "see it in the Case table tab" is actually true instead of
+            # leaving the reviewer to scroll/search for it themselves. Safe
+            # to set here (rather than raising the same StreamlitAPIException
+            # fixed earlier on the Live Agent page) because this tab's code
+            # runs BEFORE tab_cases's search widget is instantiated below, in
+            # this same script run -- not after, like that earlier bug.
+            st.session_state["investigations_search"] = case_id_from_event(result["event_id"])
 
     with tab_cases:
         events = get_all_events(conn, limit=500)
@@ -650,7 +657,7 @@ def page_investigations():
 
         fcol1, fcol2, fcol3, fcol4 = st.columns(4)
         with fcol1:
-            search = st.text_input("Search case, merchant, or order ID")
+            search = st.text_input("Search case, merchant, or order ID", key="investigations_search")
         with fcol2:
             decision_filter = st.multiselect("Decision", sorted({v["decision"] for v in views if v["decision"]}))
         with fcol3:
