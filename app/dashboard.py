@@ -419,7 +419,22 @@ def case_report_text(view: dict, overrides: list) -> str:
     """
     risk_label, _ = risk_label_for_score(view["risk_score"])
     score_display = f"{view['risk_score']:.3f}" if view["risk_score"] is not None else "not scored"
-    account_age_display = f"{view['account_age_days']:.0f} days" if view["account_age_days"] is not None else "unknown"
+    # Same unvalidated-batch-upload data render_case_detail's Merchant context
+    # panel guards against with _safe_metric_html: account_age_days can be a
+    # non-numeric value on a row that failed find_missing_or_invalid but was
+    # still logged (needs_manual_review, not discarded). This report is
+    # plain text, not HTML, so there's no XSS angle here -- but the bare
+    # f"{value:.0f}" format spec still raises ValueError on a non-numeric
+    # value and used to crash the whole report/download, which is exactly
+    # the class of bug _safe_metric_html was added to prevent, just missed
+    # in this sibling function.
+    if view["account_age_days"] is None:
+        account_age_display = "unknown"
+    else:
+        try:
+            account_age_display = f"{view['account_age_days']:.0f} days"
+        except (ValueError, TypeError):
+            account_age_display = str(view["account_age_days"])
     lines = [
         "RISKLENS CASE REPORT",
         "=====================",
@@ -1038,9 +1053,19 @@ def page_live_agent():
             # agent was still running -- kept in one place (risk_agent.py)
             # so the live view and this post-hoc view can never drift apart.
             detail = summarize_tool_result(tool, res)
+            # `tool` is the LLM's own tool_call.function.name, taken verbatim
+            # -- a hallucinated call to an undeclared name reaches here
+            # unmodified (agent/tools.py raises ValueError("Unknown tool: "
+            # + name) for it, which summarize_tool_result's first branch
+            # then echoes straight into `detail` too, via the "error: ..."
+            # prefix). The raw-trace <details> block just below this one
+            # already escapes this exact same `tool` value -- it was only
+            # ever missing here, in the always-visible timeline.
+            tool_display = html.escape(str(tool))
+            detail_display = html.escape(str(detail))
             steps_html.append(
                 f'<div class="rl-tl-step"><div class="rl-tl-rail"><div class="rl-tl-dot" style="background:{dot_color};"></div><div class="rl-tl-line"></div></div>'
-                f'<div class="rl-tl-body"><div class="rl-tl-title">{tool}</div><div class="rl-tl-detail">{detail}</div>'
+                f'<div class="rl-tl-body"><div class="rl-tl-title">{tool_display}</div><div class="rl-tl-detail">{detail_display}</div>'
                 f'<div class="rl-tl-time">{time_label}{duration_label}</div></div></div>'
             )
             # st.expander/st.json can't live inside a CSS multi-column masonry

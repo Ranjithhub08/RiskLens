@@ -83,6 +83,40 @@ def test_non_numeric_metric_field_does_not_crash_and_is_escaped():
     assert "<img" not in ctx["daily_txn"]
 
 
+FULL_CASE_VIEW = dict(
+    BASE_VIEW,
+    risk_score=0.42,
+    event_id="11111111-2222-3333-4444-555555555555",
+    timestamp_utc="2026-01-01T00:00:00+00:00",
+    source="rule_pipeline",
+    daily_txn_volume=1000.0,
+    avg_30d_txn_volume=1000.0,
+    avg_ticket_size=50.0,
+    decision="clear",
+    decision_reason="Risk score is below the escalation threshold.",
+    top_factors=None,
+    explanation=None,
+    agent_proposal=None,
+)
+
+
+def test_case_report_text_does_not_crash_on_non_numeric_account_age():
+    # Regression test: a batch-CSV row with a non-numeric account_age_days
+    # used to crash the report/download with an uncaught ValueError from
+    # the bare f"{value:.0f}" format spec -- the same failure mode
+    # _safe_metric_html was added to prevent in render_case_detail, missed
+    # in this sibling function.
+    view = dict(FULL_CASE_VIEW, account_age_days="not-a-number")
+    report = dashboard.case_report_text(view, overrides=[])
+    assert "Account age:        not-a-number" in report
+
+
+def test_case_report_text_formats_a_valid_account_age():
+    view = dict(FULL_CASE_VIEW, account_age_days=400)
+    report = dashboard.case_report_text(view, overrides=[])
+    assert "Account age:        400 days" in report
+
+
 def test_none_values_render_as_placeholder():
     view = dict(BASE_VIEW, merchant_id=None, kyc_status=None, business_category=None,
                 chargebacks_30d=None, refunds_30d=None, account_age_days=None,
