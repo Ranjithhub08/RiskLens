@@ -5,6 +5,7 @@ from gating.decision_engine import (
     DECISION_MANUAL_REVIEW,
     ESCALATE_THRESHOLD,
     FLAG_THRESHOLD,
+    LOW_CONFIDENCE_BAND,
     decide_for_record,
     decide_from_score,
 )
@@ -35,6 +36,48 @@ def test_score_exactly_at_boundary_fails_safe_to_manual_review():
 def test_none_score_fails_safe_to_manual_review():
     result = decide_from_score(None)
     assert result.decision == DECISION_MANUAL_REVIEW
+
+
+def test_nan_score_fails_safe_to_manual_review_with_an_honest_reason():
+    # Every numeric comparison in decide_from_score is False for NaN, so
+    # without an explicit isfinite() guard a NaN score used to fall through
+    # to the final `else` branch and get labeled flag_for_compliance_review
+    # with a reason claiming it "exceeds" a numeric threshold -- a
+    # fabricated comparison in what's supposed to be an honest audit trail.
+    result = decide_from_score(float("nan"))
+    assert result.decision == DECISION_MANUAL_REVIEW
+    assert "exceeds" not in result.reason.lower()
+
+
+def test_infinite_score_fails_safe_to_manual_review():
+    result = decide_from_score(float("inf"))
+    assert result.decision == DECISION_MANUAL_REVIEW
+
+
+def test_low_confidence_band_lower_edge_is_inclusive_despite_float_precision():
+    # ESCALATE_THRESHOLD - LOW_CONFIDENCE_BAND (0.50 - 0.02) isn't exactly
+    # representable in binary floating point -- it evaluates to
+    # 0.020000000000000018, not 0.02 -- so a raw, unrounded
+    # abs(risk_score - ESCALATE_THRESHOLD) <= LOW_CONFIDENCE_BAND missed a
+    # score of exactly 0.48 by that sliver and let it fall through to
+    # "clear" instead of the intended "too close to call, needs manual
+    # review" -- the wrong direction for a fail-safe boundary.
+    lower_edge = ESCALATE_THRESHOLD - LOW_CONFIDENCE_BAND
+    result = decide_from_score(lower_edge)
+    assert result.decision == DECISION_MANUAL_REVIEW
+
+
+def test_low_confidence_band_upper_edge_is_inclusive():
+    upper_edge = ESCALATE_THRESHOLD + LOW_CONFIDENCE_BAND
+    result = decide_from_score(upper_edge)
+    assert result.decision == DECISION_MANUAL_REVIEW
+
+
+def test_just_outside_low_confidence_band_is_not_manual_review():
+    # Sanity check that the rounded comparison didn't widen the band --
+    # comfortably outside it should still auto-decide.
+    result = decide_from_score(ESCALATE_THRESHOLD - LOW_CONFIDENCE_BAND - 0.05)
+    assert result.decision == DECISION_CLEAR
 
 
 def test_missing_fields_short_circuits_to_manual_review_even_with_a_score():

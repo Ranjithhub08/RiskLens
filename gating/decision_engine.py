@@ -8,6 +8,7 @@ human-readable reason. Thresholds are configuration (not hard-coded deep in
 logic) so they can be tuned and audited independently of the model.
 """
 
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -78,7 +79,31 @@ def decide_from_score(risk_score: float) -> GatingResult:
             risk_score=None,
         )
 
-    if abs(risk_score - ESCALATE_THRESHOLD) <= LOW_CONFIDENCE_BAND:
+    # NaN/inf can't come from a properly-validated, properly-scored record
+    # (pipeline.py checks for NaN features before scoring), but this
+    # function has no way to enforce that from here -- every comparison
+    # below is False for NaN, so without this guard a NaN score used to
+    # fall through to the final `else` and get labeled
+    # flag_for_compliance_review with a reason claiming it "exceeds" a
+    # numeric threshold, which is simply untrue for NaN. Fail safe instead,
+    # with a reason that doesn't assert a comparison that never happened.
+    if not math.isfinite(risk_score):
+        return GatingResult(
+            decision=DECISION_MANUAL_REVIEW,
+            reason=f"Risk score ({risk_score!r}) is not a valid number; routed for manual review.",
+            risk_score=risk_score,
+        )
+
+    # Rounded before comparing: ESCALATE_THRESHOLD - LOW_CONFIDENCE_BAND
+    # (0.50 - 0.02) isn't exactly representable in binary floating point --
+    # it evaluates to 0.020000000000000018, not 0.02 -- so a raw
+    # `abs(risk_score - ESCALATE_THRESHOLD) <= LOW_CONFIDENCE_BAND` missed
+    # a score of exactly 0.48 by that sliver and let it fall through to
+    # "clear" instead of the intended "too close to call, needs manual
+    # review". That's the wrong direction for a fail-safe boundary, so the
+    # comparison is rounded to kill the float noise instead of comparing
+    # raw floats at the exact edge.
+    if round(abs(risk_score - ESCALATE_THRESHOLD), 6) <= LOW_CONFIDENCE_BAND:
         return GatingResult(
             decision=DECISION_MANUAL_REVIEW,
             reason=(
