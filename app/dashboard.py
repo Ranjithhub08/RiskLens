@@ -230,12 +230,20 @@ def render_case_detail(view: dict):
     risk_label, risk_color = risk_label_for_score(view["risk_score"])
     score_display = f"{view['risk_score']:.2f}" if view["risk_score"] is not None else "--"
 
+    # merchant_id is free text a user typed (New investigation's manual entry,
+    # a batch CSV upload, or the Live Agent page) and is stored verbatim in
+    # the audit log -- it's never validated against a fixed format the way
+    # kyc_status/business_category are. html_block() renders with
+    # unsafe_allow_html=True, so without escaping it here, a merchant_id like
+    # <img src=x onerror=...> would execute as live HTML/JS for every future
+    # reviewer who opens this case, not just display as the literal text
+    # someone typed -- a stored XSS via the most ordinary possible input.
     html_block(
         f"""
         <div class="rl-panel">
             <div class="rl-panel-label">Merchant context</div>
             <div class="rl-kv-grid">
-                <div><div class="rl-kv-label">Merchant</div><div class="rl-kv-value">{view['merchant_id'] or '—'}</div></div>
+                <div><div class="rl-kv-label">Merchant</div><div class="rl-kv-value">{html.escape(str(view['merchant_id'])) if view['merchant_id'] else '—'}</div></div>
                 <div><div class="rl-kv-label">Account age</div><div class="rl-kv-value">{f"{view['account_age_days']:.0f} days" if view['account_age_days'] is not None else '—'}</div></div>
                 <div><div class="rl-kv-label">KYC</div><div class="rl-kv-value">{(view['kyc_status'] or '—').title()}</div></div>
                 <div><div class="rl-kv-label">Category</div><div class="rl-kv-value">{(view['business_category'] or '—').title()}</div></div>
@@ -1018,7 +1026,7 @@ def page_live_agent():
                 <div class="rl-panel">
                     <div class="rl-panel-label">Merchant</div>
                     <div class="rl-kv-grid">
-                        <div><div class="rl-kv-label">Merchant ID</div><div class="rl-kv-value">{result.get('merchant_id') or '—'}</div></div>
+                        <div><div class="rl-kv-label">Merchant ID</div><div class="rl-kv-value">{html.escape(str(result.get('merchant_id'))) if result.get('merchant_id') else '—'}</div></div>
                     </div>
                 </div>
                 <div class="rl-panel">

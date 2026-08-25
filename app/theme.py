@@ -10,6 +10,8 @@ Every color, threshold, and label here is either a fixed system constant
 computed result -- nothing in this module invents data for visual effect.
 """
 
+import html
+
 import altair as alt
 import pandas as pd
 import streamlit as st
@@ -460,7 +462,13 @@ def override_banner_html(overrides: list) -> str:
     original_style = DECISION_STYLE.get(latest["original_decision"], {"label": latest["original_decision"]})
     new_style = DECISION_STYLE.get(latest["overridden_decision"], {"label": latest["overridden_decision"]})
     when = (latest.get("timestamp_utc") or "")[:19].replace("T", " ")
-    reviewer_label = f" by {latest['reviewer']}" if latest.get("reviewer") else ""
+    # reviewer and reason are free text a human typed into the override form
+    # (see app/dashboard.py's render_override_section) -- html.escape() here
+    # for the same reason the raw trace JSON is escaped in the Live Agent
+    # view: this whole app renders its HTML with unsafe_allow_html=True, so
+    # unescaped user-typed text would be interpreted as live HTML/JS by
+    # anyone who later opens this case, not just displayed as text.
+    reviewer_label = f" by {html.escape(str(latest['reviewer']))}" if latest.get("reviewer") else ""
     history_note = (
         f'<div class="rl-override-meta">{len(overrides)} override(s) recorded for this case &mdash; showing the most recent.</div>'
         if len(overrides) > 1
@@ -470,7 +478,7 @@ def override_banner_html(overrides: list) -> str:
     <div class="rl-override-banner">
         <b>&#9998; Reviewer override{reviewer_label}</b> &mdash; changed from
         <b>{original_style['label']}</b> to <b>{new_style['label']}</b>.
-        <div class="rl-override-meta">&ldquo;{latest['reason']}&rdquo; &nbsp;&#183;&nbsp; {when} UTC</div>
+        <div class="rl-override-meta">&ldquo;{html.escape(str(latest['reason']))}&rdquo; &nbsp;&#183;&nbsp; {when} UTC</div>
         {history_note}
     </div>
     """
@@ -530,11 +538,19 @@ def agent_recommendation_card_html(agent_proposal) -> str:
     single unit for a balanced layout (e.g. a CSS masonry grid)."""
     agent_decision = (agent_proposal or {}).get("recommended_decision")
     agent_style = DECISION_STYLE.get(agent_decision, {"color": TEXT_MUTED, "label": (agent_decision or "No proposal")})
+    # The agent's reasoning is LLM-generated text, not a fixed template like
+    # the gate's reason strings -- and the transaction it reasons about
+    # includes the merchant_id a user typed in, unconstrained, on the Live
+    # Agent page. Escaped for the same reason merchant_id itself is escaped
+    # in dashboard.py: this whole app renders HTML with unsafe_allow_html=True,
+    # so unescaped text here would be interpreted as live markup rather than
+    # displayed as the words it actually is.
+    reasoning = html.escape(str((agent_proposal or {}).get("reasoning", "No reasoning returned.")))
     return f"""
     <div class="rl-compare-col">
         <div class="rl-compare-title">AI agent recommendation</div>
         <div class="rl-compare-decision" style="color:{agent_style['color']};">{agent_style['label']}</div>
-        <div class="rl-compare-sub">{(agent_proposal or {}).get('reasoning', 'No reasoning returned.')}</div>
+        <div class="rl-compare-sub">{reasoning}</div>
     </div>
     """
 
