@@ -883,12 +883,21 @@ def page_live_agent():
     if "agent_merchant_id_input" not in st.session_state:
         st.session_state["agent_merchant_id_input"] = f"live-demo-merchant-{secrets.token_hex(3)}"
 
+    def _randomize_merchant_id():
+        # Streamlit forbids writing to a widget's own session_state key
+        # after that widget has already been instantiated in the current
+        # script run (raises StreamlitAPIException) -- a plain `if
+        # st.button(...): st.session_state[key] = ...` block runs AFTER
+        # the text_input above it has already been drawn, so it hit that
+        # exact error. A button's on_click callback runs BEFORE the script
+        # reruns and redraws any widgets, so updating the value there is
+        # the correct, safe way to do this.
+        st.session_state["agent_merchant_id_input"] = f"live-demo-merchant-{secrets.token_hex(3)}"
+
     c1, c2 = st.columns(2)
     with c1:
         agent_merchant_id = st.text_input("Merchant ID", key="agent_merchant_id_input")
-        if st.button("🎲 Try a different simulated merchant"):
-            st.session_state["agent_merchant_id_input"] = f"live-demo-merchant-{secrets.token_hex(3)}"
-            st.rerun()
+        st.button("🎲 Try a different simulated merchant", on_click=_randomize_merchant_id)
     with c2:
         agent_amount = st.number_input("Transaction amount (INR)", value=5000.0, min_value=1.0)
     st.caption(
