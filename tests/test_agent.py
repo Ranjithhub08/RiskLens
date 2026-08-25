@@ -325,3 +325,50 @@ def test_tool_error_is_captured_not_raised(tools):
     assert "error" in result["trace"][0]["result"]
     assert result["risk_score"] is None
     assert result["gated_decision"] == "needs_manual_review"
+
+
+def test_score_and_explain_reject_unrecognized_business_category(tools):
+    """Regression test: RiskAgentTools.score_transaction_risk/explain_transaction_risk
+    must fail safe (an error dict) on a category the model doesn't recognize,
+    the same way pipeline.py's score_record already does via
+    find_missing_or_invalid -- not silently one-hot-encode it as "no
+    category" and return a normal-looking score. The tool schema's
+    business_category field has no enum constraint (only kyc_status does),
+    and even an enum is only ever a hint to the model, not something every
+    provider enforces -- so this has to be checked in the tool itself."""
+    bad_args = {k: v for k, v in MERCHANT_ARGS.items() if k != "merchant_id"}
+    bad_args["business_category"] = "retail"  # not one of features.BUSINESS_CATEGORIES
+
+    score_result = tools.score_transaction_risk(**bad_args)
+    assert "error" in score_result
+    assert "risk_score" not in score_result
+
+    explain_result = tools.explain_transaction_risk(**bad_args)
+    assert "error" in explain_result
+
+    # A recognized category must still score normally.
+    good_args = dict(bad_args, business_category="services")
+    good_result = tools.score_transaction_risk(**good_args)
+    assert "risk_score" in good_result
+    assert isinstance(good_result["risk_score"], float)
+
+
+def test_simulated_merchants_never_have_impossible_chargeback_or_refund_rates():
+    """Regression test: get_merchant_context's chargebacks_30d/refunds_30d
+    must scale with total_txns_30d (as data/raw/generate_data.py's actual
+    training data does), not be drawn independently of it. An earlier
+    version drew them independently, which meant roughly 1% of merchant IDs
+    got a chargeback_rate or refund_rate above 100% -- more chargebacks/
+    refunds than transactions, a value the model never sees in training --
+    reachable through the Live Agent's "Try a different simulated merchant"
+    button, i.e. through completely ordinary use of the most visible,
+    judge-facing part of the app."""
+    for i in range(2000):
+        ctx = get_merchant_context(f"regression-check-{i}")
+        total = ctx["total_txns_30d"]
+        assert ctx["chargebacks_30d"] / total <= 1.0, ctx
+        assert ctx["refunds_30d"] / total <= 1.0, ctx
+
+    # Same merchant_id must always produce the same profile (determinism is
+    # the whole point -- demos need to be reproducible).
+    assert get_merchant_context("joy123") == get_merchant_context("joy123")
