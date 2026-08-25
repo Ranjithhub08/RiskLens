@@ -55,13 +55,29 @@ def validate_raw(df: pd.DataFrame) -> list:
     return [c for c in RAW_REQUIRED_COLUMNS if c not in df.columns]
 
 
+_VALID_KYC_STATUSES = {"complete", "incomplete"}
+_VALID_BUSINESS_CATEGORIES = {c.lower() for c in BUSINESS_CATEGORIES}
+
+
 def find_missing_or_invalid(df: pd.DataFrame) -> list:
     """
-    Return the required raw column names that are either absent, or present
-    but null/empty, for the (single-row) record in df. This is what the
-    pipeline uses to decide whether it's safe to score at all -- it names
-    the actual field, rather than reporting a generic "invalid data" reason
-    after the fact.
+    Return the required raw column names that are either absent, present but
+    null/empty, or -- for the two categorical fields -- present but not a
+    value the model actually recognizes, for the (single-row) record in df.
+    This is what the pipeline uses to decide whether it's safe to score at
+    all -- it names the actual field, rather than reporting a generic
+    "invalid data" reason after the fact.
+
+    An unrecognized kyc_status/business_category (a typo, or a category the
+    model was never trained on) matters here specifically because
+    transform_features one-hot-encodes these fields: a value that doesn't
+    match any known category silently produces an all-zero encoding rather
+    than a NaN, which would otherwise slip past this check and the model
+    would score it anyway as if no category applied -- a wrong answer with
+    no warning, which is worse than failing safe to manual review. Casing
+    differences (e.g. "Complete", "ELECTRONICS") are normalized here and in
+    transform_features rather than rejected, since those aren't actually
+    invalid data, just differently formatted valid data.
     """
     problems = []
     for col in RAW_REQUIRED_COLUMNS:
@@ -71,7 +87,13 @@ def find_missing_or_invalid(df: pd.DataFrame) -> list:
         val = df[col].iloc[0] if len(df) else None
         if val is None or (isinstance(val, float) and np.isnan(val)) or pd.isna(val):
             problems.append(col)
-        elif isinstance(val, str) and val.strip() == "":
+            continue
+        if isinstance(val, str) and val.strip() == "":
+            problems.append(col)
+            continue
+        if col == "kyc_status" and isinstance(val, str) and val.strip().lower() not in _VALID_KYC_STATUSES:
+            problems.append(col)
+        elif col == "business_category" and isinstance(val, str) and val.strip().lower() not in _VALID_BUSINESS_CATEGORIES:
             problems.append(col)
     return problems
 
@@ -109,7 +131,12 @@ def transform_features(df: pd.DataFrame, strict: bool = True) -> pd.DataFrame:
         kyc = df["kyc_status"]
     else:
         kyc = pd.Series([None] * len(df), index=df.index)
-    out["kyc_complete"] = (kyc == "complete").astype(float)
+    # Case/whitespace-normalized before comparing -- "Complete" or " complete "
+    # is still valid input (find_missing_or_invalid already rejected anything
+    # that isn't recognized even after normalizing), it just shouldn't be
+    # silently scored as "incomplete" only because of formatting.
+    kyc_norm = kyc.astype(str).str.strip().str.lower()
+    out["kyc_complete"] = (kyc_norm == "complete").astype(float)
     out.loc[kyc.isna(), "kyc_complete"] = np.nan
 
     daily_vol = pd.to_numeric(_col_or_nan(df, "daily_txn_volume"), errors="coerce")
@@ -128,8 +155,14 @@ def transform_features(df: pd.DataFrame, strict: bool = True) -> pd.DataFrame:
         category = df["business_category"]
     else:
         category = pd.Series([None] * len(df), index=df.index)
+    # Same case/whitespace normalization as kyc_status above, and for the
+    # same reason: a differently-formatted but valid category (e.g.
+    # "Electronics") should still one-hot-encode correctly instead of
+    # matching none of the known categories and silently scoring as if no
+    # category applied at all.
+    category_norm = category.astype(str).str.strip().str.lower()
     for c in BUSINESS_CATEGORIES:
-        out[f"category_{c}"] = (category == c).astype(float)
+        out[f"category_{c}"] = (category_norm == c).astype(float)
         out.loc[category.isna(), f"category_{c}"] = np.nan
 
     # Any row with NaNs after transformation (from bad/missing raw values that

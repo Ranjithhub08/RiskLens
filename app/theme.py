@@ -238,11 +238,12 @@ div.stVerticalBlock[class*="st-key-panel_"] {{
 /* ---- Risk scale ---- */
 .rl-scale-wrap {{ margin: 14px 0 6px 0; }}
 .rl-scale-track {{ position: relative; height: 6px; border-radius: 3px; width: 100%;
-    background: linear-gradient(to right, {GREEN} 0%, {GREEN} 40%, {AMBER} 40%, {AMBER} 75%, {ORANGE} 75%, {ORANGE} 100%); }}
+    background: linear-gradient(to right, {GREEN} 0%, {GREEN} {ESCALATE_THRESHOLD * 100:.0f}%, {AMBER} {ESCALATE_THRESHOLD * 100:.0f}%, {AMBER} {FLAG_THRESHOLD * 100:.0f}%, {ORANGE} {FLAG_THRESHOLD * 100:.0f}%, {ORANGE} 100%); }}
 .rl-scale-marker {{ position: absolute; top: -6px; width: 2px; height: 18px; background: var(--rl-text); }}
 .rl-scale-marker::after {{ content: attr(data-score); position: absolute; top: -22px; left: 50%; transform: translateX(-50%);
     font-family: 'Space Grotesk', sans-serif; font-size: 0.7rem; font-weight: 700; color: var(--rl-text); white-space: nowrap; }}
 .rl-scale-labels {{ display: flex; justify-content: space-between; margin-top: 6px; font-size: 0.65rem; color: var(--rl-text-muted); }}
+.rl-scale-note {{ margin-top: 4px; font-size: 0.65rem; color: var(--rl-text-muted); line-height: 1.4; }}
 
 /* ---- Authority strip ---- */
 .rl-authority {{ display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;
@@ -422,15 +423,16 @@ def risk_scale_html(score) -> str:
     if score is None:
         marker = ""
     else:
-        pct = max(0.0, min(1.0, score)) * 100
+        pct = round(max(0.0, min(1.0, score)) * 100, 2)
         marker = f'<div class="rl-scale-marker" style="left:calc({pct}% - 1px);" data-score="{score:.2f}"></div>'
     return f"""
     <div class="rl-scale-wrap">
         <div class="rl-scale-track">{marker}</div>
         <div class="rl-scale-labels">
             <span>0.00 Clear</span><span>{ESCALATE_THRESHOLD:.2f} Escalate</span>
-            <span>{FLAG_THRESHOLD:.2f} Compliance review</span><span>1.00 Manual review</span>
+            <span>{FLAG_THRESHOLD:.2f} Flag for compliance review</span><span>1.00</span>
         </div>
+        <div class="rl-scale-note">Needs manual review instead, regardless of score: input was missing/invalid, or the score was too close to {ESCALATE_THRESHOLD:.2f} to call automatically.</div>
     </div>
     """
 
@@ -828,18 +830,29 @@ def decision_volume_chart(df: pd.DataFrame):
 
 
 def model_comparison_table_html(xgb: dict, base: dict, left_label: str = "XGBoost", right_label: str = "Logistic Regression") -> str:
-    rows = [
+    # "Higher wins" only makes sense for metrics where bigger is genuinely
+    # better. Decision threshold isn't one of those -- it's just each
+    # model's own tuned operating point, not a competition score -- so it's
+    # rendered plainly below, with no winner dot or highlight color (a
+    # previous version compared it like the others, which meant "XGBoost
+    # wins" purely because its threshold happened to be a bigger number).
+    comparable_rows = [
         ("Precision", xgb["precision"], base["precision"]),
         ("Recall", xgb["recall"], base["recall"]),
         ("F1", xgb["f1"], base["f1"]),
         ("ROC-AUC", xgb["roc_auc"], base["roc_auc"]),
-        ("Decision threshold", xgb["threshold"], base["threshold"]),
     ]
     body_rows = "".join(
         f'<tr><td style="padding:9px 14px 9px 0; color:var(--rl-text-dim); border-top:1px solid var(--rl-border);">{label}</td>'
         f'<td style="padding:9px 14px; text-align:right; font-family:\'Space Grotesk\',sans-serif; font-weight:600; border-top:1px solid var(--rl-border); color:{"var(--rl-text)" if xg >= bl else "var(--rl-text-dim)"};">{xg:.3f}{" &#9679;" if xg >= bl else ""}</td>'
         f'<td style="padding:9px 0 9px 14px; text-align:right; font-family:\'Space Grotesk\',sans-serif; font-weight:600; border-top:1px solid var(--rl-border); color:{"var(--rl-text)" if bl > xg else "var(--rl-text-dim)"};">{bl:.3f}{" &#9679;" if bl > xg else ""}</td></tr>'
-        for label, xg, bl in rows
+        for label, xg, bl in comparable_rows
+    )
+    body_rows += (
+        f'<tr><td style="padding:9px 14px 9px 0; color:var(--rl-text-dim); border-top:1px solid var(--rl-border);">Decision threshold '
+        f'<span style="color:var(--rl-text-muted); font-size:0.68rem;">(own tuned point, not a competition score)</span></td>'
+        f'<td style="padding:9px 14px; text-align:right; font-family:\'Space Grotesk\',sans-serif; font-weight:600; border-top:1px solid var(--rl-border); color:var(--rl-text-dim);">{xgb["threshold"]:.3f}</td>'
+        f'<td style="padding:9px 0 9px 14px; text-align:right; font-family:\'Space Grotesk\',sans-serif; font-weight:600; border-top:1px solid var(--rl-border); color:var(--rl-text-dim);">{base["threshold"]:.3f}</td></tr>'
     )
     return f"""
     <table style="width:100%; border-collapse:collapse; font-size:0.86rem;">
