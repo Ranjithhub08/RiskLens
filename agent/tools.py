@@ -13,7 +13,7 @@ import pandas as pd
 from agent.merchant_context import get_merchant_context as _get_merchant_context
 from audit.audit_log import get_all_events, get_events_for_merchant
 from explainability.explain import RiskExplainer
-from features.features import transform_features
+from features.features import find_missing_or_invalid, transform_features
 
 TOOL_SCHEMAS = [
     {
@@ -169,13 +169,42 @@ class RiskAgentTools:
     def _row_from_args(self, args: dict) -> pd.DataFrame:
         return pd.DataFrame([{k: v for k, v in args.items() if k != "merchant_id"}])
 
+    def _validated_row_from_args(self, args: dict):
+        """Returns (X, error_dict) -- exactly one of the two is not None.
+
+        score_transaction_risk/explain_transaction_risk's tool schemas
+        declare kyc_status as a fixed enum, but that's a hint to the model,
+        not a server-side guarantee every provider enforces, and
+        business_category isn't even constrained to an enum there at all --
+        it's a plain string. Without this check, a hallucinated or
+        mistyped category (e.g. "retail", which isn't one of
+        features.BUSINESS_CATEGORIES) would reach transform_features
+        directly, which one-hot-encodes anything it doesn't recognize as
+        all-zero rather than raising -- silently scoring as if the merchant
+        had no business category at all, and returning a normal-looking
+        risk_score with no error, instead of the same fail-safe
+        needs_manual_review outcome the exact same record would get through
+        pipeline.py's score_record (which does run this check). Reusing
+        find_missing_or_invalid here closes that gap instead of leaving the
+        agent's own tools as a second, less-validated path to the model.
+        """
+        row = self._row_from_args(args)
+        problems = find_missing_or_invalid(row)
+        if problems:
+            return None, {"error": f"Cannot score: missing or invalid field(s): {problems}."}
+        return transform_features(row), None
+
     def score_transaction_risk(self, **args) -> dict:
-        X = transform_features(self._row_from_args(args))
+        X, error = self._validated_row_from_args(args)
+        if error:
+            return error
         score = float(self.model.predict_proba(X)[:, 1][0])
         return {"risk_score": score}
 
     def explain_transaction_risk(self, **args) -> dict:
-        X = transform_features(self._row_from_args(args))
+        X, error = self._validated_row_from_args(args)
+        if error:
+            return error
         return self.explainer.explain_row(X)
 
     def get_recent_audit_history(self, merchant_id: str) -> dict:
