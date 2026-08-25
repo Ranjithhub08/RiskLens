@@ -285,7 +285,94 @@ def render_case_detail(view: dict):
 
     render_override_section(view)
 
+    report_overrides = get_overrides_for_event(conn, view["event_id"])
+    st.download_button(
+        "Download case report",
+        data=case_report_text(view, report_overrides),
+        file_name=f"{case_id_from_event(view['event_id'])}_report.txt",
+        mime="text/plain",
+        key=f"download_report_{view['event_id']}",
+    )
     st.caption(f"Audit event ID: `{view['event_id']}`")
+
+
+def case_report_text(view: dict, overrides: list) -> str:
+    """
+    A plain-text, self-contained export of one case -- everything shown on
+    the case detail panel, in one file a reviewer can save, email, or attach
+    to a compliance ticket without needing to open RiskLens itself. Exists
+    because the audit trail being real and queryable (Section 4.6) is only
+    useful to a reviewer if a single case can also leave the app in a form
+    someone outside it can read.
+    """
+    risk_label, _ = risk_label_for_score(view["risk_score"])
+    score_display = f"{view['risk_score']:.3f}" if view["risk_score"] is not None else "not scored"
+    account_age_display = f"{view['account_age_days']:.0f} days" if view["account_age_days"] is not None else "unknown"
+    lines = [
+        "RISKLENS CASE REPORT",
+        "=====================",
+        f"Case ID:      {case_id_from_event(view['event_id'])}",
+        f"Event ID:     {view['event_id']}",
+        f"Generated:    {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
+        f"Recorded:     {view['timestamp_utc'] or 'unknown'}",
+        f"Pipeline:     {view['source']}",
+        "",
+        "MERCHANT",
+        "--------",
+        f"Merchant ID:        {view['merchant_id'] or 'unknown'}",
+        f"Account age:        {account_age_display}",
+        f"KYC status:         {view['kyc_status'] or 'unknown'}",
+        f"Business category:  {view['business_category'] or 'unknown'}",
+        f"Daily txn volume:   {view['daily_txn_volume'] if view['daily_txn_volume'] is not None else 'unknown'}",
+        f"30-day average:     {view['avg_30d_txn_volume'] if view['avg_30d_txn_volume'] is not None else 'unknown'}",
+        f"Chargebacks (30d):  {view['chargebacks_30d'] if view['chargebacks_30d'] is not None else 'unknown'}",
+        f"Refunds (30d):      {view['refunds_30d'] if view['refunds_30d'] is not None else 'unknown'}",
+        f"Avg ticket size:    {view['avg_ticket_size'] if view['avg_ticket_size'] is not None else 'unknown'}",
+        "",
+        "RISK ASSESSMENT",
+        "---------------",
+        f"Risk score:     {score_display} ({risk_label})",
+        f"Final decision: {(view['decision'] or 'unknown').replace('_', ' ').title()}",
+        f"Reason:         {view['decision_reason'] or 'n/a'}",
+        "",
+    ]
+    if view.get("top_factors"):
+        lines.append("Top contributing factors:")
+        for f in view["top_factors"]:
+            lines.append(f"  - {f.get('feature')}: SHAP {f.get('shap_value'):+.4f}")
+        lines.append("")
+    if view.get("explanation"):
+        lines += ["Explanation:", f"  {view['explanation']}", ""]
+
+    if view["source"] == "agent_pipeline" and view.get("agent_proposal"):
+        proposal = view["agent_proposal"]
+        agree = proposal.get("recommended_decision") == view["decision"]
+        lines += [
+            "AGENT PROPOSAL",
+            "--------------",
+            f"Recommended decision: {(proposal.get('recommended_decision') or 'unknown').replace('_', ' ').title()}",
+            f"Agreed with gate:     {'yes' if agree else 'no'}",
+            f"Reasoning:            {proposal.get('reasoning', 'n/a')}",
+            "",
+        ]
+
+    lines += ["HUMAN OVERRIDE HISTORY", "----------------------"]
+    if not overrides:
+        lines.append("No overrides recorded for this case.")
+    else:
+        for o in overrides:
+            lines += [
+                f"[{o['timestamp_utc']}] {o['original_decision']} -> {o['overridden_decision']}"
+                + (f"  (reviewer: {o['reviewer']})" if o.get("reviewer") else ""),
+                f"  Reason: {o['reason']}",
+            ]
+    lines += [
+        "",
+        "---",
+        "This report is a point-in-time export of an append-only audit record.",
+        "The decision above cannot be edited -- only overridden with a new, separately logged record.",
+    ]
+    return "\n".join(lines)
 
 
 def render_override_section(view: dict):

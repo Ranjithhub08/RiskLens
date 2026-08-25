@@ -93,11 +93,13 @@ The thresholds (0.40 / 0.75) are configuration, not hard-coded logic — deliber
 - A small query script/dashboard tab lets you pull "show me every decision for merchant X" or "show me every high-risk flag in the last 7 days."
 
 ### 4.7 Application Layer
-- **Streamlit dashboard** with four views:
-  1. **Score a case** — pick or input a merchant/transaction, see the risk score, the plain-language explanation, and the gating decision, via the deterministic pipeline.
-  2. **Live agent** — creates a real Razorpay test-mode Order and runs the LLM reasoning loop over it end to end; see Section 11.
-  3. **Model performance** — precision/recall/F1/ROC curve/confusion matrix from the held-out test set, shown visually. This is what you point to when a judge asks "how do you know it works."
-  4. **Audit log viewer** — searchable history of past decisions from *either* pipeline (tagged by `source`), proving the audit trail is real and queryable, not just a design claim.
+- **Streamlit dashboard** with six views:
+  1. **Overview** — command center: KPIs, risk activity/distribution over the current session, recent investigations, system health.
+  2. **Investigations** — score a case via the deterministic pipeline, and a searchable/filterable case table with a full case detail panel (merchant context, risk assessment, SHAP, human override control, audit reference). See Section 12 for the override flow.
+  3. **Batch Scoring** — upload a CSV of merchants (or sample from the dataset) and score an entire portfolio in one pass through the *same* pipeline as a single case, with a ranked report and CSV export. See Section 12.3.
+  4. **Live agent** — creates a real Razorpay test-mode Order and runs the LLM reasoning loop over it end to end, streaming its reasoning live; see Section 11.
+  5. **Model performance** — precision/recall/F1/ROC curve/confusion matrix from the held-out test set, shown visually, plus an interactive threshold explorer (Section 12.4) and the retrain-from-feedback flow (Section 12.2). This is what you point to when a judge asks "how do you know it works."
+  6. **Audit log viewer** — searchable history of past decisions from *either* pipeline (tagged by `source`), plus a system monitoring section (Section 12.5) and the full human-feedback table, proving the audit trail is real and queryable, not just a design claim.
 - **Optional API layer** (FastAPI) wrapping the model as a `/score` endpoint — not required, but makes the project look production-shaped if you have time, and gives you something concrete to describe in a panel interview about how this would plug into a real system.
 
 ## 5. End-to-End Data Flow (one request, step by step)
@@ -115,7 +117,7 @@ The thresholds (0.40 / 0.75) are configuration, not hard-coded logic — deliber
 - **Missing fields:** validated before scoring; if required fields are absent, the system routes straight to "needs manual review" rather than guessing or imputing silently.
 - **Out-of-range values:** clipped/flagged rather than crashing the pipeline.
 - **Low-confidence predictions:** a configurable confidence floor (e.g., predictions between 0.45–0.55, close to the decision boundary) are also routed to manual review rather than trusted outright — the model admits uncertainty instead of forcing a decision.
-- **Model/data drift (mentioned, not fully implemented):** the architecture reserves a place for periodic re-evaluation against fresh held-out data; noted explicitly in Limitations as a real production requirement this demo doesn't fully implement.
+- **Model/data drift:** full statistical drift detection (e.g. tracking the incoming score distribution against the training distribution) is not implemented. What *is* implemented is an operational proxy for the same concern — the System Monitoring section (Section 12.5) surfaces the human override rate and the agent/gate agreement rate over time, both of which are early, human-interpretable signals that something about the model or the data has shifted, without requiring a separate drift-detection subsystem.
 
 ## 7. Evaluation Methodology
 
@@ -135,16 +137,17 @@ risklens/
 │   └── features.py           # shared feature engineering (train + inference)
 ├── model/
 │   ├── train.py               # training + evaluation script
+│   ├── feedback.py             # overrides -> training rows, candidate retrain, human-gated promotion
 │   └── artifacts/              # saved model, metrics, plots
 ├── explainability/
 │   └── explain.py              # SHAP wrapper + plain-language templating
 ├── gating/
 │   └── decision_engine.py       # threshold logic, fail-safe routing (used by BOTH pipelines)
 ├── audit/
-│   └── audit_log.py             # append-only logging + query helpers
+│   └── audit_log.py             # append-only logging + query helpers, plus the human_overrides table
 ├── agent/
-│   ├── risk_agent.py             # the LLM reasoning loop (Groq, function calling)
-│   ├── tools.py                   # tool definitions the agent may call
+│   ├── risk_agent.py             # the LLM reasoning loop (Groq, function calling, live step streaming)
+│   ├── tools.py                   # tool definitions the agent may call (incl. similar-past-cases lookup)
 │   └── merchant_context.py         # simulated merchant history lookup
 ├── integrations/
 │   └── razorpay_client.py          # real Razorpay test-mode API calls (Order creation)
@@ -152,7 +155,10 @@ risklens/
 ├── agent_pipeline.py                  # agentic scoring pipeline (Razorpay + agent + gate + audit)
 ├── config.py                            # loads secrets from .env (never hardcoded)
 ├── app/
-│   └── dashboard.py                      # Streamlit app (4 tabs)
+│   ├── dashboard.py                      # Streamlit app (6 pages, see Section 4.7)
+│   └── theme.py                           # shared UI styling, chart builders
+├── .streamlit/
+│   └── config.toml                          # fixed light theme (native widgets otherwise follow OS dark mode)
 ├── api/                                    # optional
 │   └── main.py                              # FastAPI /score endpoint
 ├── tests/
@@ -160,7 +166,8 @@ risklens/
 │   ├── test_gating.py
 │   ├── test_audit_log.py
 │   ├── test_pipeline.py
-│   └── test_agent.py                          # agent loop tests, scripted fake LLM client
+│   ├── test_agent.py                          # agent loop tests, scripted fake LLM client
+│   └── test_feedback.py                        # override -> training row mapping, promotion safety
 ├── docs/
 │   └── ARCHITECTURE.md                          # this document
 ├── .env.example                                   # template for local secrets (never committed)
@@ -194,7 +201,8 @@ risklens/
 | "Every money action explainable, bounded and gated" | Sections 4.4–4.5 — SHAP-based explanations + a rules-based gating layer that never auto-freezes |
 | "Documented audit trails" | Section 4.6 — append-only log, queryable via dashboard, now also carrying the agent's full reasoning trace |
 | "Graceful failure handling" | Section 6 — explicit fail-safe routing on missing data / low confidence, and on agent turn-exhaustion or malformed output (Section 11) |
-| "Practical functionality and transparent limitations" | Section 12 below |
+| "Practical functionality and transparent limitations" | Section 13 below |
+| "Continuous improvement / learns over time" | Section 12 — human override becomes labeled feedback, a candidate model is retrained and compared before a human decides whether to promote it |
 | "Agentic workflows — an agent loop, not fixed logic" | Section 11 — an LLM decides which tools to call and in what order; nothing about the investigation sequence is hard-coded |
 | "Live prototyping — real APIs, not mock" | Section 11.2 — every "Live agent" run creates a genuine Order against Razorpay's test-mode API and gets a real Order ID back |
 
@@ -234,7 +242,33 @@ The agent loop is hand-rolled directly against Groq's function-calling API rathe
 - **Tool errors:** if a tool call fails (e.g. the agent passes incomplete fields to `score_transaction_risk`), the error is caught and fed back to the agent as a tool result rather than crashing the loop. See `test_tool_error_is_captured_not_raised`.
 - **Missing configuration:** if `GROQ_API_KEY` or the Razorpay keys aren't set, the dashboard's "Live agent" tab shows a clear message and disables itself rather than crashing — the other three tabs are unaffected.
 
-## 12. Limitations and Future Work
+## 12. Human Feedback Loop, Scale, and Monitoring
+
+Sections 4.5 and 11.1 establish one boundary: the model and the agent both only ever *propose*, and a small deterministic gate is what actually decides. This section extends the same pattern one layer further, to what happens after a decision is made — because a system that can never be corrected, never learns, and can only be checked one case at a time isn't accountable in practice, even if its individual decisions are explainable in principle.
+
+### 12.1 Human override
+
+`audit/audit_log.py` adds a second table, `human_overrides`, deliberately separate from `audit_events` rather than a column bolted onto it. The original scoring event — what the model and gate decided, and why — must stay exactly as it was decided, immutable, forever; a human correcting it later is a new fact layered on top ("a reviewer later disagreed and changed the outcome"), never an edit to history. `log_override` writes the corrected decision and a required reason; `get_overrides_for_event` and `get_all_overrides` read them back. The Investigations page's case detail panel shows both the original decision and any override history side by side, and `tests/test_audit_log.py::test_log_override_does_not_touch_the_original_event` locks in that an override can never mutate the row it corrects.
+
+### 12.2 Retrain from feedback
+
+`model/feedback.py` is where an override stops being just a record and becomes training signal. `build_feedback_rows` turns every override into one labeled row in the exact schema `model/train.py` expects — a correction to "clear" becomes a not-risky ground-truth example, a correction to anything else becomes risky — pulling the underlying feature values back out of the original audit event (straightforward for the deterministic pipeline, which stores the full snapshot; recovered from the agent's own recorded `get_merchant_context` tool call for the agentic pipeline, since that path only stores the transaction in its input snapshot).
+
+`train_candidate_with_feedback` combines those rows with the original training CSV, re-splits time-ordered exactly as `model/train.py` does, and reports the candidate's metrics against the *currently deployed* model on the same held-out test split, so the comparison is apples-to-apples rather than against stale numbers. Training a candidate never touches the live model file. `promote_candidate` is the one function that does — and it is only ever called from an explicit button click after a person has looked at the before/after comparison, mirroring the agent/gate split: retraining is the "propose" half, promotion is the "decide" half, and only a human performs the second one.
+
+### 12.3 Batch scoring
+
+The Batch Scoring page lets a CSV of many merchants (or a sample from the dataset) be scored in one pass. Deliberately, this does not introduce a second scoring code path: each row is run through the exact same `pipeline.score_record` used by a single Investigations case, and is written to the audit trail exactly the same way. A batch run is a UI convenience for triaging a portfolio at once (e.g. every merchant onboarded in a week), not a shortcut that bypasses explainability, gating, or the audit log for the sake of throughput.
+
+### 12.4 Threshold explorer
+
+The Models page includes an interactive what-if slider that recomputes precision, recall, F1, and the confusion matrix at any decision threshold, directly on the held-out test set's actual predicted probabilities. This is explicitly a simulator, not a control — moving it never changes `gating/decision_engine.py`'s live `ESCALATE_THRESHOLD` / `FLAG_THRESHOLD`, which stay fixed, versioned, and reviewed separately. Its purpose is to make a threshold choice demonstrable (a judge can see the real cost of moving it — fewer false positives always costs some recall) rather than asserted in prose.
+
+### 12.5 System monitoring
+
+The Audit Trail page's monitoring section reports three portfolio-level numbers computed fresh from the audit log on every load: the human override rate (what fraction of all decisions a reviewer has since corrected), the agent/gate agreement rate (how often the agent's own recommendation matches what the gate actually decided, for agentic-pipeline cases), and decision volume over time. These are deliberately different in kind from the Overview page's KPIs, which describe *what's* happening right now — this describes *how well the system is behaving*, the kind of number that matters more the longer the system runs, and the closest thing this project has to production monitoring without building a full drift-detection subsystem (see Section 6).
+
+## 13. Limitations and Future Work
 
 - Trained on public/synthetic data as a stand-in for Razorpay's real transaction and KYC signals; real-world performance would need retraining on actual platform data.
 - The gating thresholds (0.40 / 0.75) are illustrative starting points, not tuned against a real cost-of-false-positive vs. cost-of-false-negative analysis, which a production deployment would require.
