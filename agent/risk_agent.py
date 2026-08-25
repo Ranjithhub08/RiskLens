@@ -260,6 +260,21 @@ def run_risk_agent(
 
 
 def _finalize(agent_proposal, agent_raw_response, computed_risk_score, explanation, top_factors, trace, on_step=None) -> dict:
+    # agent_proposal is untrusted: it's either the model's raw submit_decision
+    # tool-call arguments, or the result of parsing its plain-text final reply
+    # as JSON (see _parse_final_json). Neither path guarantees a dict -- a
+    # provider could in principle return non-object tool-call arguments, and
+    # a plain-text reply can be valid-but-non-object JSON like "42" or
+    # "true". Treating anything that isn't a dict as "no proposal" (the same
+    # outcome as the model not answering at all) means a malformed final
+    # answer fails safe to the gate's own decision instead of crashing this
+    # function on `.get()` -- which used to happen here, and worse, happened
+    # before log_event runs upstream in agent_pipeline.py, so the case
+    # silently never reached the audit log at all instead of landing in
+    # needs_manual_review like every other failure mode in this module.
+    if not isinstance(agent_proposal, dict):
+        agent_proposal = None
+
     gating_result = decide_from_score(computed_risk_score)
     agreement = (
         agent_proposal is not None
@@ -269,7 +284,7 @@ def _finalize(agent_proposal, agent_raw_response, computed_risk_score, explanati
         on_step,
         {
             "type": "final",
-            "decision": (agent_proposal or {}).get("recommended_decision") if agent_proposal else None,
+            "decision": agent_proposal.get("recommended_decision") if agent_proposal else None,
             "gated_decision": gating_result.decision,
             "agree": agreement,
         },

@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.merchant_context import get_merchant_context
-from agent.risk_agent import run_risk_agent
+from agent.risk_agent import _finalize, run_risk_agent
 from agent.tools import RiskAgentTools
 from audit.audit_log import get_connection, log_event
 from explainability.explain import RiskExplainer
@@ -372,3 +372,39 @@ def test_simulated_merchants_never_have_impossible_chargeback_or_refund_rates():
     # Same merchant_id must always produce the same profile (determinism is
     # the whole point -- demos need to be reproducible).
     assert get_merchant_context("joy123") == get_merchant_context("joy123")
+
+
+def test_finalize_treats_non_dict_agent_proposal_as_no_proposal():
+    """Regression test: _parse_final_json only guarantees valid JSON, not a
+    JSON *object* -- a model's final plain-text reply of "42", "true", or
+    "[1,2]" is all valid JSON that isn't a dict. _finalize used to call
+    agent_proposal.get(...) unconditionally whenever agent_proposal wasn't
+    None, so a non-dict value raised AttributeError -- and because that
+    crash happened before agent_pipeline.py's log_event call, the case
+    never reached the audit log at all instead of failing safe to
+    needs_manual_review like every other failure mode in this module."""
+    result = _finalize(
+        agent_proposal=42,
+        agent_raw_response="42",
+        computed_risk_score=0.55,
+        explanation="some explanation",
+        top_factors=None,
+        trace=[],
+    )
+    assert result["agent_proposal"] is None
+    # The independent gate still produces a real decision from the score --
+    # a malformed agent answer must not block the fail-safe outcome.
+    assert result["gated_decision"] is not None
+    assert result["agent_and_gate_agree"] is False
+
+
+def test_finalize_still_handles_a_well_formed_dict_proposal():
+    result = _finalize(
+        agent_proposal={"recommended_decision": "escalate", "reasoning": "high chargeback rate"},
+        agent_raw_response='{"recommended_decision": "escalate", "reasoning": "high chargeback rate"}',
+        computed_risk_score=0.55,
+        explanation="some explanation",
+        top_factors=None,
+        trace=[],
+    )
+    assert result["agent_proposal"]["recommended_decision"] == "escalate"
