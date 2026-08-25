@@ -226,32 +226,87 @@ def extract_case_view(event: dict) -> dict:
     return view
 
 
+def _safe_metric_html(value, formatter, default="—"):
+    """Format+escape a case-detail field that may hold unvalidated data.
+
+    Batch Scoring lets someone upload an arbitrary CSV straight into
+    score_record(); a row that fails find_missing_or_invalid isn't
+    discarded -- it's still logged and still routed to a viewable case
+    (that's what "needs_manual_review" means), so account_age_days /
+    daily_txn_volume / avg_30d_txn_volume / avg_ticket_size can legitimately
+    be a non-numeric string by the time a reviewer opens this panel. Without
+    this guard, `f"{value:.0f}"` on such a row raises ValueError and takes
+    down the entire case-detail render. html.escape() on the fallback path
+    also closes the same stored-XSS hole merchant_id was fixed for below --
+    a non-numeric value here is exactly as attacker-reachable as merchant_id.
+    """
+    if value is None:
+        return default
+    try:
+        return formatter(value)
+    except (ValueError, TypeError):
+        return html.escape(str(value))
+
+
+def merchant_context_display_values(view: dict) -> dict:
+    """Escaped/formatted strings for the case-detail Merchant context panel.
+
+    Pulled out of render_case_detail as a plain function (no Streamlit call
+    in it) specifically so this escaping logic is unit-testable directly --
+    the earlier stored-XSS fixes in this file had no test coverage at all,
+    which is exactly how the sibling gap this function closes (kyc_status/
+    business_category/chargebacks_30d/refunds_30d never being escaped, only
+    merchant_id) went unnoticed for as long as it did.
+
+    merchant_id is free text a user typed (New investigation's manual entry,
+    a batch CSV upload, or the Live Agent page) and is stored verbatim in
+    the audit log -- it's never validated against a fixed format the way
+    kyc_status/business_category are. render_case_detail renders this via
+    html_block(unsafe_allow_html=True), so without escaping, a merchant_id
+    like <img src=x onerror=...> would execute as live HTML/JS for every
+    future reviewer who opens this case -- a stored XSS via the most
+    ordinary possible input.
+
+    kyc_status/business_category/chargebacks_30d/refunds_30d are exactly as
+    reachable via the same batch-CSV path as merchant_id -- a row whose
+    business_category fails the allow-list check in find_missing_or_invalid
+    is still logged and still displayed here, not discarded. chargebacks_30d
+    /refunds_30d aren't validated at all (find_missing_or_invalid has no
+    bounds/type check for them), so they need the same escaping even though
+    they "look" numeric.
+    """
+    return {
+        "merchant": html.escape(str(view['merchant_id'])) if view['merchant_id'] else '—',
+        "kyc": html.escape(str(view['kyc_status']).title()) if view['kyc_status'] else '—',
+        "category": html.escape(str(view['business_category']).title()) if view['business_category'] else '—',
+        "chargebacks": html.escape(str(view['chargebacks_30d'])) if view['chargebacks_30d'] is not None else '—',
+        "refunds": html.escape(str(view['refunds_30d'])) if view['refunds_30d'] is not None else '—',
+        "account_age": _safe_metric_html(view['account_age_days'], lambda v: f"{v:.0f} days"),
+        "daily_txn": _safe_metric_html(view['daily_txn_volume'], lambda v: f"₹{v:,.2f}"),
+        "avg_30d": _safe_metric_html(view['avg_30d_txn_volume'], lambda v: f"₹{v:,.2f}"),
+        "avg_ticket": _safe_metric_html(view['avg_ticket_size'], lambda v: f"₹{v:,.2f}"),
+    }
+
+
 def render_case_detail(view: dict):
     risk_label, risk_color = risk_label_for_score(view["risk_score"])
     score_display = f"{view['risk_score']:.2f}" if view["risk_score"] is not None else "--"
+    ctx = merchant_context_display_values(view)
 
-    # merchant_id is free text a user typed (New investigation's manual entry,
-    # a batch CSV upload, or the Live Agent page) and is stored verbatim in
-    # the audit log -- it's never validated against a fixed format the way
-    # kyc_status/business_category are. html_block() renders with
-    # unsafe_allow_html=True, so without escaping it here, a merchant_id like
-    # <img src=x onerror=...> would execute as live HTML/JS for every future
-    # reviewer who opens this case, not just display as the literal text
-    # someone typed -- a stored XSS via the most ordinary possible input.
     html_block(
         f"""
         <div class="rl-panel">
             <div class="rl-panel-label">Merchant context</div>
             <div class="rl-kv-grid">
-                <div><div class="rl-kv-label">Merchant</div><div class="rl-kv-value">{html.escape(str(view['merchant_id'])) if view['merchant_id'] else '—'}</div></div>
-                <div><div class="rl-kv-label">Account age</div><div class="rl-kv-value">{f"{view['account_age_days']:.0f} days" if view['account_age_days'] is not None else '—'}</div></div>
-                <div><div class="rl-kv-label">KYC</div><div class="rl-kv-value">{(view['kyc_status'] or '—').title()}</div></div>
-                <div><div class="rl-kv-label">Category</div><div class="rl-kv-value">{(view['business_category'] or '—').title()}</div></div>
-                <div><div class="rl-kv-label">Txn volume</div><div class="rl-kv-value">{f"₹{view['daily_txn_volume']:,.2f}" if view['daily_txn_volume'] is not None else '—'}</div></div>
-                <div><div class="rl-kv-label">30d average</div><div class="rl-kv-value">{f"₹{view['avg_30d_txn_volume']:,.2f}" if view['avg_30d_txn_volume'] is not None else '—'}</div></div>
-                <div><div class="rl-kv-label">Chargebacks</div><div class="rl-kv-value">{view['chargebacks_30d'] if view['chargebacks_30d'] is not None else '—'}</div></div>
-                <div><div class="rl-kv-label">Refunds</div><div class="rl-kv-value">{view['refunds_30d'] if view['refunds_30d'] is not None else '—'}</div></div>
-                <div><div class="rl-kv-label">Avg ticket</div><div class="rl-kv-value">{f"₹{view['avg_ticket_size']:,.2f}" if view['avg_ticket_size'] is not None else '—'}</div></div>
+                <div><div class="rl-kv-label">Merchant</div><div class="rl-kv-value">{ctx['merchant']}</div></div>
+                <div><div class="rl-kv-label">Account age</div><div class="rl-kv-value">{ctx['account_age']}</div></div>
+                <div><div class="rl-kv-label">KYC</div><div class="rl-kv-value">{ctx['kyc']}</div></div>
+                <div><div class="rl-kv-label">Category</div><div class="rl-kv-value">{ctx['category']}</div></div>
+                <div><div class="rl-kv-label">Txn volume</div><div class="rl-kv-value">{ctx['daily_txn']}</div></div>
+                <div><div class="rl-kv-label">30d average</div><div class="rl-kv-value">{ctx['avg_30d']}</div></div>
+                <div><div class="rl-kv-label">Chargebacks</div><div class="rl-kv-value">{ctx['chargebacks']}</div></div>
+                <div><div class="rl-kv-label">Refunds</div><div class="rl-kv-value">{ctx['refunds']}</div></div>
+                <div><div class="rl-kv-label">Avg ticket</div><div class="rl-kv-value">{ctx['avg_ticket']}</div></div>
             </div>
         </div>
         <div class="rl-panel">
@@ -1230,7 +1285,7 @@ def render_retrain_from_feedback_section():
     st.caption(
         f"Trained on {result['combined_rows']} rows: the original training set plus "
         f"{result['feedback_rows_used']} usable override(s)"
-        + (f" ({skipped} skipped -- incomplete feature data)." if skipped else ".")
+        + (f" ({skipped} skipped -- incomplete feature data, or superseded by a later override on the same case)." if skipped else ".")
     )
     html_block(
         f"""
