@@ -34,6 +34,7 @@ import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from agent.case_qa import answer_case_question
 from agent.risk_agent import summarize_tool_result
 from agent_pipeline import run_agentic_scoring
 from app.theme import (
@@ -286,6 +287,8 @@ def render_case_detail(view: dict):
     render_override_section(view)
 
     report_overrides = get_overrides_for_event(conn, view["event_id"])
+    render_case_qa_section(view, report_overrides)
+
     st.download_button(
         "Download case report",
         data=case_report_text(view, report_overrides),
@@ -294,6 +297,51 @@ def render_case_detail(view: dict):
         key=f"download_report_{view['event_id']}",
     )
     st.caption(f"Audit event ID: `{view['event_id']}`")
+
+
+def render_case_qa_section(view: dict, overrides: list):
+    """
+    Read-only natural-language Q&A grounded in this one case's own recorded
+    data (see agent/case_qa.py's module docstring for why this needs no
+    gate in front of it, unlike the Live Agent's proposal: it has no tools
+    and cannot take or recommend any action, so there is nothing here for a
+    deterministic check to need to catch -- the worst outcome is a badly
+    phrased explanation, never an unauthorized decision).
+    """
+    event_id = view["event_id"]
+    with st.expander("Ask about this case"):
+        if not GROQ_CONFIGURED:
+            st.caption(
+                "Needs GROQ_API_KEY configured (see .env.example) to answer questions -- every "
+                "other part of RiskLens works fully without it; this one feature just needs an LLM."
+            )
+            return
+
+        st.caption(
+            "Ask in plain language -- answers are grounded only in this case's own recorded data "
+            "above, and this cannot override or change anything (use the control above for that)."
+        )
+
+        history_key = f"_case_qa_history_{event_id}"
+        history = st.session_state.setdefault(history_key, [])
+
+        for turn in history:
+            with st.chat_message(turn["role"]):
+                st.write(turn["content"])
+
+        question = st.chat_input("e.g. Why was this flagged?", key=f"qa_input_{event_id}")
+        if question:
+            with st.chat_message("user"):
+                st.write(question)
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    try:
+                        answer = answer_case_question(question, case_report_text(view, overrides), history=history)
+                    except Exception as exc:  # noqa: BLE001 -- surface the failure, don't crash the page
+                        answer = f"Couldn't get an answer: {exc}"
+                st.write(answer)
+            history.append({"role": "user", "content": question})
+            history.append({"role": "assistant", "content": answer})
 
 
 def case_report_text(view: dict, overrides: list) -> str:

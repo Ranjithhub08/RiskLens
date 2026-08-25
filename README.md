@@ -16,6 +16,7 @@ Full design rationale, data flow, the agent's reasoning-loop design, and a point
 - **Bounded, deterministic gate** (`DETERMINISTIC-GATE-01`) — a small, versioned rules layer is the only thing that turns a score into a real decision. The model and the agent both only ever *recommend*.
 - **Live agent investigation** — an LLM (via Groq) investigates a real Razorpay test-mode order step by step, streaming its reasoning live rather than just returning a final answer, and can pull similar past cases in the same business category for context.
 - **Human override** — a reviewer can correct any decision with a reason. The original decision is never edited or deleted; the correction is a new, separate, equally immutable record layered on top of it.
+- **Ask about this case** — a natural-language Q&A box on the case detail panel, grounded only in that one case's own recorded data. It has no tools and cannot take or recommend any action -- purely a read-only explainer for a reviewer working through a case.
 - **Retrain from feedback** — every override becomes a labeled training row. A candidate model can be retrained on the original data plus that feedback and compared against the currently deployed model on the same held-out test set. Promoting the candidate to production is a separate button — training never silently replaces what's live.
 - **Batch scoring** — upload a CSV of merchants (or sample from the dataset) and score an entire portfolio in one pass through the exact same pipeline as a single case, with a ranked report and CSV export.
 - **Threshold explorer** — an interactive slider showing the real precision/recall tradeoff at any decision threshold on the held-out test set, so a threshold choice is demonstrable rather than just asserted.
@@ -66,13 +67,13 @@ uvicorn api.main:app --reload --port 8000
 - `gating/decision_engine.py` — the bounding layer: plain rules mapping a score to clear/escalate/flag/manual-review, with a fail-safe path for low-confidence or invalid input. Used by **both** pipelines below — it's the one authority neither the deterministic path nor the agent can bypass.
 - `audit/audit_log.py` — append-only SQLite audit trail (`audit_events`), plus a separate append-only `human_overrides` table for reviewer corrections — tagged by which pipeline produced each event
 - `pipeline.py` — the deterministic scoring pipeline (used by the dashboard's Investigations and Batch Scoring pages, and the API)
-- `agent/` — the agentic layer: `risk_agent.py` (the LLM reasoning loop, via Groq function calling, with a timestamped/timed tool-call trace and live step-by-step streaming), `tools.py` (what the agent is allowed to call, including looking up similar past cases), `merchant_context.py` (simulated merchant history)
+- `agent/` — the agentic layer: `risk_agent.py` (the LLM reasoning loop, via Groq function calling, with a timestamped/timed tool-call trace and live step-by-step streaming), `tools.py` (what the agent is allowed to call, including looking up similar past cases), `merchant_context.py` (simulated merchant history), `case_qa.py` (read-only natural-language Q&A grounded in one case's own data, no tools, no actions)
 - `integrations/razorpay_client.py` — real calls to Razorpay's test-mode API (Order creation)
 - `agent_pipeline.py` — the agentic scoring pipeline (Razorpay + agent + gate + audit), used by the Live Agent page
 - `config.py` — loads `GROQ_API_KEY` / `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` from a local `.env` file (see `.env.example`) — never hardcoded, never committed
 - `app/dashboard.py` + `app/theme.py` — the console UI: a native sidebar-navigated app (Overview, Investigations, Batch Scoring, Live Agent, Models, Audit Trail) with real, interactive (Altair) charts throughout
 - `api/main.py` — optional FastAPI `/score` endpoint
-- `tests/` — 48 tests covering feature engineering, gating logic, the audit log and override table, the deterministic pipeline, the agent loop, and the feedback/retrain flow (with a scripted fake LLM client so the suite runs offline) (`pytest tests/`)
+- `tests/` — 53 tests covering feature engineering, gating logic, the audit log and override table, the deterministic pipeline, the agent loop, the case Q&A, and the feedback/retrain flow (with a scripted fake LLM client so the suite runs offline) (`pytest tests/`)
 
 ## What's real vs. simulated
 
