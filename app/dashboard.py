@@ -514,7 +514,7 @@ def page_overview():
             if len(scored) >= 3:
                 df = pd.DataFrame(scored)[["timestamp_utc", "risk_score", "decision"]]
                 df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce")
-                st.altair_chart(risk_activity_chart(df), use_container_width=True)
+                st.altair_chart(risk_activity_chart(df), width="stretch")
             else:
                 st.caption(
                     f"Not enough scored events yet to plot risk over time (need at least 3, have {len(scored)}). "
@@ -529,7 +529,7 @@ def page_overview():
                 counts[d] = counts.get(d, 0) + 1
         with st.container(border=True, key="panel_risk_distribution"):
             html_block('<div class="rl-panel-label">Risk distribution</div>')
-            st.altair_chart(risk_distribution_chart(counts), use_container_width=True)
+            st.altair_chart(risk_distribution_chart(counts), width="stretch")
 
     with st.container(border=True, key="panel_recent_investigations"):
         html_block('<div class="rl-panel-label">Recent investigations</div>')
@@ -1072,15 +1072,15 @@ def page_models():
     with col_roc:
         with st.container(border=True, key="panel_roc_curve"):
             html_block('<div class="rl-panel-label">ROC curve</div>')
-            st.altair_chart(roc_chart(chart_data["roc_curve"]), use_container_width=True)
+            st.altair_chart(roc_chart(chart_data["roc_curve"]), width="stretch")
     with col_cm:
         with st.container(border=True, key="panel_confusion_matrix"):
             html_block(f'<div class="rl-panel-label">Confusion matrix &middot; XGBoost (threshold {xgb["threshold"]:.2f})</div>')
-            st.altair_chart(confusion_matrix_chart(chart_data["confusion_matrix"]), use_container_width=True)
+            st.altair_chart(confusion_matrix_chart(chart_data["confusion_matrix"]), width="stretch")
 
     with st.container(border=True, key="panel_shap_global"):
         html_block('<div class="rl-panel-label">Global feature importance (SHAP, test set)</div>')
-        st.altair_chart(shap_global_chart(chart_data["shap_global_importance"]), use_container_width=True)
+        st.altair_chart(shap_global_chart(chart_data["shap_global_importance"]), width="stretch")
 
     render_threshold_explorer(xgb["threshold"])
     render_retrain_from_feedback_section()
@@ -1153,7 +1153,7 @@ def render_threshold_explorer(default_threshold: float):
     cm_data = {"labels": ["Not risky", "Risky"], "matrix": [[tn, fp], [fn, tp]]}
     with st.container(border=True, key="panel_threshold_cm"):
         html_block(f'<div class="rl-panel-label">Confusion matrix at threshold {threshold:.2f}</div>')
-        st.altair_chart(confusion_matrix_chart(cm_data), use_container_width=True)
+        st.altair_chart(confusion_matrix_chart(cm_data), width="stretch")
 
 
 def render_retrain_from_feedback_section():
@@ -1293,7 +1293,7 @@ def render_monitoring_section(events: list):
         vol_df["timestamp_utc"] = pd.to_datetime(vol_df["timestamp_utc"], utc=True, errors="coerce")
         with st.container(border=True, key="panel_decision_volume"):
             html_block('<div class="rl-panel-label">Decision volume over time</div>')
-            st.altair_chart(decision_volume_chart(vol_df), use_container_width=True)
+            st.altair_chart(decision_volume_chart(vol_df), width="stretch")
     else:
         st.caption(f"Not enough events yet to plot volume over time (need at least 3, have {len(dated)}).")
 
