@@ -785,6 +785,48 @@ def risk_distribution_chart(counts: dict):
     return chart
 
 
+def decision_volume_chart(df: pd.DataFrame):
+    """df: columns timestamp_utc (datetime), decision (str).
+
+    Stacked bar of decision volume over time, bucketed adaptively (like
+    risk_activity_chart) so a demo session spanning a few minutes doesn't
+    collapse into a single bar the way a fixed daily bucket would.
+    """
+    df = df.copy()
+    df["decision_label"] = df["decision"].map(lambda d: DECISION_STYLE.get(d, {}).get("label", d or "Unknown"))
+
+    span_seconds = (df["timestamp_utc"].max() - df["timestamp_utc"].min()).total_seconds()
+    if span_seconds < 3600:
+        freq, time_format = "1min", "%H:%M"
+    elif span_seconds < 86400:
+        freq, time_format = "15min", "%H:%M"
+    else:
+        freq, time_format = "1D", "%b %d"
+
+    df["bucket"] = df["timestamp_utc"].dt.floor(freq)
+    grouped = df.groupby(["bucket", "decision_label"]).size().reset_index(name="count")
+
+    color_scale = alt.Scale(
+        domain=[DECISION_STYLE[k]["label"] for k in [DECISION_CLEAR, DECISION_ESCALATE, DECISION_FLAG, DECISION_MANUAL_REVIEW]],
+        range=[GREEN, AMBER, ORANGE, RED],
+    )
+    return (
+        alt.Chart(grouped)
+        .mark_bar()
+        .encode(
+            x=alt.X("bucket:T", title=None, axis=alt.Axis(format=time_format, labelAngle=0)),
+            y=alt.Y("count:Q", title="Decisions"),
+            color=alt.Color("decision_label:N", title="Decision", scale=color_scale),
+            tooltip=[
+                alt.Tooltip("bucket:T", title="Time", format=time_format),
+                alt.Tooltip("decision_label:N", title="Decision"),
+                alt.Tooltip("count:Q", title="Count"),
+            ],
+        )
+        .properties(height=260, autosize=alt.AutoSizeParams(type="fit-x", contains="padding"))
+    )
+
+
 def model_comparison_table_html(xgb: dict, base: dict, left_label: str = "XGBoost", right_label: str = "Logistic Regression") -> str:
     rows = [
         ("Precision", xgb["precision"], base["precision"]),
