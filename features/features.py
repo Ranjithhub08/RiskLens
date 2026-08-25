@@ -58,6 +58,21 @@ def validate_raw(df: pd.DataFrame) -> list:
 _VALID_KYC_STATUSES = {"complete", "incomplete"}
 _VALID_BUSINESS_CATEGORIES = {c.lower() for c in BUSINESS_CATEGORIES}
 
+# Every other required field is a non-negative count or amount -- a negative
+# chargebacks_30d or avg_ticket_size can't come from anything real, and
+# should fail safe to manual review exactly like a missing value would,
+# rather than flowing into chargeback_rate/refund_rate below as a
+# nonsensical negative rate the model has never seen in training.
+_NUMERIC_NONNEGATIVE_COLUMNS = {
+    "account_age_days",
+    "daily_txn_volume",
+    "avg_30d_txn_volume",
+    "total_txns_30d",
+    "chargebacks_30d",
+    "refunds_30d",
+    "avg_ticket_size",
+}
+
 
 def find_missing_or_invalid(df: pd.DataFrame) -> list:
     """
@@ -78,6 +93,17 @@ def find_missing_or_invalid(df: pd.DataFrame) -> list:
     differences (e.g. "Complete", "ELECTRONICS") are normalized here and in
     transform_features rather than rejected, since those aren't actually
     invalid data, just differently formatted valid data.
+
+    The categorical checks compare str(val) rather than requiring val
+    already be a str -- an earlier version only checked kyc_status/
+    business_category when isinstance(val, str) was true, so a
+    business_category of 42 or a kyc_status of 1 (a hallucinated tool
+    argument, or a batch CSV cell pandas parsed as a number) skipped the
+    check entirely and reached the same silent all-zero encoding this
+    function exists to prevent. Numeric fields get the equivalent
+    treatment: a value that can't convert to a finite, non-negative number
+    is flagged too, instead of being coerced downstream into a negative
+    rate with no warning.
     """
     problems = []
     for col in RAW_REQUIRED_COLUMNS:
@@ -91,10 +117,22 @@ def find_missing_or_invalid(df: pd.DataFrame) -> list:
         if isinstance(val, str) and val.strip() == "":
             problems.append(col)
             continue
-        if col == "kyc_status" and isinstance(val, str) and val.strip().lower() not in _VALID_KYC_STATUSES:
-            problems.append(col)
-        elif col == "business_category" and isinstance(val, str) and val.strip().lower() not in _VALID_BUSINESS_CATEGORIES:
-            problems.append(col)
+        if col == "kyc_status":
+            if str(val).strip().lower() not in _VALID_KYC_STATUSES:
+                problems.append(col)
+            continue
+        if col == "business_category":
+            if str(val).strip().lower() not in _VALID_BUSINESS_CATEGORIES:
+                problems.append(col)
+            continue
+        if col in _NUMERIC_NONNEGATIVE_COLUMNS:
+            try:
+                num = float(val)
+            except (TypeError, ValueError):
+                problems.append(col)
+                continue
+            if not np.isfinite(num) or num < 0:
+                problems.append(col)
     return problems
 
 

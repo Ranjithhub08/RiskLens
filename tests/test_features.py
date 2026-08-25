@@ -106,6 +106,49 @@ def test_find_missing_or_invalid_flags_empty_string():
     assert "business_category" in problems
 
 
+def test_find_missing_or_invalid_flags_non_string_category_and_kyc():
+    # A hallucinated tool argument or a batch-CSV cell pandas parsed as a
+    # number is just as unrecognized as a mistyped string -- an earlier
+    # version of find_missing_or_invalid only checked kyc_status/
+    # business_category when isinstance(val, str) was true, so a non-string
+    # value like this skipped the check entirely and reached
+    # transform_features' one-hot encoding, which silently produces an
+    # all-zero row for it instead of raising.
+    row = dict(VALID_ROW, kyc_status=1, business_category=42)
+    df = pd.DataFrame([row])
+    problems = find_missing_or_invalid(df)
+    assert "kyc_status" in problems
+    assert "business_category" in problems
+
+
+def test_find_missing_or_invalid_flags_negative_numeric_fields():
+    # chargebacks_30d/refunds_30d/etc. are counts and amounts -- negative
+    # values can't come from anything real and would otherwise flow into
+    # chargeback_rate/refund_rate as a nonsensical negative rate with no
+    # warning.
+    row = dict(VALID_ROW, chargebacks_30d=-10, avg_ticket_size=-1.0)
+    df = pd.DataFrame([row])
+    problems = find_missing_or_invalid(df)
+    assert "chargebacks_30d" in problems
+    assert "avg_ticket_size" in problems
+
+
+def test_find_missing_or_invalid_flags_non_numeric_string_in_numeric_field():
+    row = dict(VALID_ROW, total_txns_30d="not-a-number")
+    df = pd.DataFrame([row])
+    problems = find_missing_or_invalid(df)
+    assert "total_txns_30d" in problems
+
+
+def test_find_missing_or_invalid_allows_zero_numeric_fields():
+    # Zero is a legitimate value (a brand-new merchant with 0 chargebacks,
+    # or 0 days old) -- only negative/non-finite/non-numeric should be
+    # rejected.
+    row = dict(VALID_ROW, chargebacks_30d=0, account_age_days=0)
+    df = pd.DataFrame([row])
+    assert find_missing_or_invalid(df) == []
+
+
 def test_find_missing_or_invalid_empty_on_valid_row():
     df = pd.DataFrame([VALID_ROW])
     assert find_missing_or_invalid(df) == []
