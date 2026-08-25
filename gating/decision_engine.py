@@ -12,14 +12,35 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 # Configurable thresholds -- see docs/ARCHITECTURE.md section 4.5 for the
-# reasoning behind these starting values.
-ESCALATE_THRESHOLD = 0.40
-FLAG_THRESHOLD = 0.75
+# reasoning behind these values.
+#
+# These are NOT arbitrary round numbers -- the trained model's predicted
+# probabilities are naturally compressed into a fairly narrow band (roughly
+# 0.33-0.69 on held-out data, not the full 0-1 range a probability could in
+# principle span), because the synthetic training data only weakly separates
+# risky from clean merchants. Thresholds of 0.40 / 0.75 were an earlier,
+# untested guess that sat almost entirely *inside* that compressed band --
+# in practice that meant nearly every record landed in "escalate" or
+# "needs manual review", and "clear" and "flag" almost never fired at all
+# (see model/artifacts/metrics.json and the note in decide_from_score below).
+#
+# The values below were instead picked from where the model's own held-out
+# validation scores actually fall (see model/train.py's load_and_split /
+# the Threshold Explorer on the Models page): ESCALATE_THRESHOLD sits just
+# above the dense cluster of "ordinary" scores (~80th percentile), and
+# FLAG_THRESHOLD sits at the start of the long high-risk tail (~90th
+# percentile). Re-run model/train.py and re-check this distribution any
+# time the training data changes -- these are tuned to the current model,
+# not universal constants.
+ESCALATE_THRESHOLD = 0.50
+FLAG_THRESHOLD = 0.62
 
 # If the model's score sits within this band around the escalate threshold,
 # treat it as "too close to call confidently" and fail safe to manual
-# review rather than trusting the raw number.
-LOW_CONFIDENCE_BAND = 0.05
+# review rather than trusting the raw number. Kept small relative to the
+# thresholds above precisely because the model's score range is itself
+# narrow -- a wide band here would swallow most of the "clear" bucket.
+LOW_CONFIDENCE_BAND = 0.02
 
 DECISION_CLEAR = "clear"
 DECISION_ESCALATE = "escalate"
