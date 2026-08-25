@@ -41,7 +41,6 @@ app = FastAPI(title="RiskLens API", description="Explainable merchant risk scori
 
 _model = None
 _explainer = None
-_conn = None
 
 
 class MerchantRecord(BaseModel):
@@ -59,10 +58,9 @@ class MerchantRecord(BaseModel):
 
 @app.on_event("startup")
 def load_resources():
-    global _model, _explainer, _conn
+    global _model, _explainer
     _model = load_model()
     _explainer = RiskExplainer(_model)
-    _conn = get_connection()
 
 
 @app.get("/health")
@@ -72,5 +70,25 @@ def health():
 
 @app.post("/score")
 def score(record: MerchantRecord):
-    result = score_record(record.model_dump(), _model, _explainer, _conn)
+    # A fresh connection per request, used only by the thread handling that
+    # request and closed when it's done -- NOT a single connection object
+    # shared across every request. FastAPI dispatches this sync `def`
+    # handler to a thread pool, so concurrent /score calls really do run on
+    # different OS threads; a single sqlite3.Connection reused across all of
+    # them (the previous behavior, via a startup-time global) let two
+    # concurrent writers interleave INSERT/commit calls on the very same
+    # connection object. Reproduced under load: intermittent
+    # "cannot start a transaction within a transaction" / "cannot commit --
+    # no transaction is active" errors, and worse, HTTP 200 responses whose
+    # audit row silently never made it into audit_events at all -- a real
+    # hole in "every scoring event is written here, append-only" under
+    # nothing more exotic than ordinary concurrent traffic. SQLite itself
+    # safely supports multiple connections to the same file as long as each
+    # is only ever touched by one thread, which get_connection()'s per-call
+    # schema check/migration is cheap enough to make the right default here.
+    conn = get_connection()
+    try:
+        result = score_record(record.model_dump(), _model, _explainer, conn)
+    finally:
+        conn.close()
     return result
