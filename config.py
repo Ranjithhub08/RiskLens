@@ -29,4 +29,20 @@ def require_razorpay_keys():
             "RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET are not set. "
             "Copy .env.example to .env and fill in your test-mode keys."
         )
+    # Razorpay key IDs are always prefixed rzp_test_ or rzp_live_ -- this
+    # project's whole premise (see integrations/razorpay_client.py's module
+    # docstring, and the "TEST MODE" pill the dashboard always shows) is
+    # that it only ever creates test-mode orders. Nothing before this point
+    # actually checked that the configured key is a test key, so pasting a
+    # live key into .env by mistake -- an easy slip, since Razorpay's
+    # dashboard shows both key sets side by side -- would authenticate
+    # against Razorpay's live API and create real Order records, with the
+    # UI still confidently labeled "TEST MODE" the whole time.
+    if not RAZORPAY_KEY_ID.startswith("rzp_test_"):
+        raise RuntimeError(
+            "RAZORPAY_KEY_ID does not look like a test-mode key (expected it to "
+            "start with 'rzp_test_'). RiskLens is a demo that only ever creates "
+            "test-mode orders -- refusing to run against what looks like a live "
+            "key. Double-check RAZORPAY_KEY_ID in your .env file."
+        )
     return RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET
