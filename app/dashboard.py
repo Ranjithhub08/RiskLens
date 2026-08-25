@@ -26,6 +26,7 @@ Run:
 import html
 import json
 import os
+import secrets
 import sys
 from datetime import datetime, timezone
 
@@ -870,11 +871,33 @@ def page_live_agent():
         )
         return
 
+    # The simulated merchant history (agent/merchant_context.py) is
+    # deterministic on purpose -- same Merchant ID -> same simulated
+    # profile every time, so a demo is reproducible. That's easy to
+    # mistake for a bug if the field is left on its default and "Run
+    # investigation" is clicked more than once: same ID in, same
+    # everything out, including the agent's own reasoning text.
+    # A fresh random-looking default per page visit, plus an explicit
+    # "different merchant" button, make that obvious instead of
+    # surprising.
+    if "agent_merchant_id_input" not in st.session_state:
+        st.session_state["agent_merchant_id_input"] = f"live-demo-merchant-{secrets.token_hex(3)}"
+
     c1, c2 = st.columns(2)
     with c1:
-        agent_merchant_id = st.text_input("Merchant ID", value="live-demo-merchant-1")
+        agent_merchant_id = st.text_input("Merchant ID", key="agent_merchant_id_input")
+        if st.button("🎲 Try a different simulated merchant"):
+            st.session_state["agent_merchant_id_input"] = f"live-demo-merchant-{secrets.token_hex(3)}"
+            st.rerun()
     with c2:
         agent_amount = st.number_input("Transaction amount (INR)", value=5000.0, min_value=1.0)
+    st.caption(
+        "The transaction is a real Razorpay test-mode order, but the merchant's history (account age, "
+        "chargebacks, KYC, etc.) is simulated -- and simulated **from the Merchant ID itself**, so the "
+        "same ID always produces the same simulated profile, score, and reasoning on purpose (this makes "
+        "demos reproducible). To see a different outcome, change the Merchant ID -- or click the button "
+        "above for a fresh one -- before running again."
+    )
 
     if st.button("Run investigation", type="primary", key="agent_run_btn"):
         result, error_message = None, None
