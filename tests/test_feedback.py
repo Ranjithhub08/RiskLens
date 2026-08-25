@@ -60,6 +60,25 @@ def test_build_feedback_rows_maps_clear_override_to_not_risky(conn):
     assert rows.iloc[0]["merchant_id"] == "M1"
 
 
+def test_build_feedback_rows_dedupes_to_the_latest_override_per_case(conn):
+    """Regression test: a case can be overridden more than once (app/
+    dashboard.py's render_override_section explicitly supports "Record
+    another override" so a reviewer can correct their own earlier mistake).
+    build_feedback_rows used to emit one training row per override ROW, not
+    per case -- a stale, superseded override and its correction became two
+    feedback rows with IDENTICAL features but OPPOSITE is_risky labels, and
+    the stale one was never dropped, silently injecting label noise into
+    every future retrain. Only the reviewer's most recent verdict on a case
+    should survive into the training set."""
+    event_id = log_event(conn, "M1", RULE_SNAPSHOT, 0.85, None, "explanation", "escalate", "reason")
+    log_override(conn, event_id, "escalate", "escalate", "first, mistaken override")
+    log_override(conn, event_id, "escalate", DECISION_CLEAR, "self-corrected: confirmed legitimate")
+
+    rows = build_feedback_rows(conn)
+    assert len(rows) == 1
+    assert rows.iloc[0]["is_risky"] == 0  # the corrected label, not the stale one
+
+
 def test_build_feedback_rows_maps_non_clear_override_to_risky(conn):
     event_id = log_event(conn, "M1", RULE_SNAPSHOT, 0.1, None, "explanation", "clear", "reason")
     log_override(conn, event_id, "clear", "flag_for_compliance_review", "Actually risky on closer review.")

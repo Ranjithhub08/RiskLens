@@ -94,8 +94,21 @@ def _extract_features_from_event(event: dict) -> dict:
 
 def build_feedback_rows(conn) -> pd.DataFrame:
     """
-    One row per human override, in the exact schema model/train.py expects --
-    ready to append onto the original training data for a retrain.
+    One row per human-overridden CASE (event_id), in the exact schema
+    model/train.py expects -- ready to append onto the original training
+    data for a retrain.
+
+    A case can be overridden more than once -- app/dashboard.py's
+    render_override_section explicitly supports "Record another override"
+    on a case that already has one, so a reviewer can correct their own
+    earlier override. get_all_overrides(conn) returns every override ROW,
+    most-recent-first, not one per event -- iterating it directly used to
+    turn a self-correction into two feedback rows with IDENTICAL features
+    but OPPOSITE is_risky labels, and the stale, superseded row was never
+    dropped, silently injecting label noise into every future retrain
+    proportional to how many times a case was re-reviewed. Deduplicating to
+    the latest override per event_id here (relying on that most-recent-first
+    ordering) keeps only the reviewer's current verdict on each case.
 
     Label mapping: a reviewer correcting a case to "clear" is a ground-truth
     NOT-risky example (is_risky=0); correcting it to anything else (escalate,
@@ -126,9 +139,17 @@ def build_feedback_rows(conn) -> pd.DataFrame:
     same silent-corruption failure mode this function's docstring already
     guards against, just reachable through this second path instead.
     """
-    rows = []
+    latest_override_by_event = {}
     for override in get_all_overrides(conn):
-        event = get_event_by_id(conn, override["event_id"])
+        # most-recent-first ordering means the first override seen here for
+        # a given event_id is the reviewer's latest word on that case --
+        # setdefault keeps only that one and ignores any older, superseded
+        # override on the same event.
+        latest_override_by_event.setdefault(override["event_id"], override)
+
+    rows = []
+    for event_id, override in latest_override_by_event.items():
+        event = get_event_by_id(conn, event_id)
         if not event:
             continue
         features = _extract_features_from_event(event)
