@@ -13,6 +13,7 @@ dashboard's "Live agent" tab.
 from agent.risk_agent import run_risk_agent
 from agent.tools import RiskAgentTools
 from audit.audit_log import log_event
+from gating.decision_engine import DECISION_MANUAL_REVIEW
 from integrations.razorpay_client import create_test_order, order_to_transaction_fields
 
 
@@ -26,17 +27,47 @@ def run_agentic_scoring(merchant_id: str, amount_rupees: float, model, explainer
     on_step: optional callback forwarded straight to run_risk_agent, so a UI
     can render the investigation live as it happens (see risk_agent.py).
     """
-    order = create_test_order(amount_rupees, merchant_id)
-    txn_fields = order_to_transaction_fields(order)
+    try:
+        order = create_test_order(amount_rupees, merchant_id)
+        txn_fields = order_to_transaction_fields(order)
 
-    tools = RiskAgentTools(model, explainer, conn)
-    transaction = {
-        "merchant_id": merchant_id,
-        "daily_txn_volume": txn_fields["daily_txn_volume"],
-        "razorpay_order_id": txn_fields["razorpay_order_id"],
-    }
+        tools = RiskAgentTools(model, explainer, conn)
+        transaction = {
+            "merchant_id": merchant_id,
+            "daily_txn_volume": txn_fields["daily_txn_volume"],
+            "razorpay_order_id": txn_fields["razorpay_order_id"],
+        }
 
-    agent_result = run_risk_agent(transaction, tools, groq_client=groq_client, on_step=on_step)
+        agent_result = run_risk_agent(transaction, tools, groq_client=groq_client, on_step=on_step)
+    except Exception:
+        # create_test_order is a real, unauthenticated-on-failure network
+        # call to Razorpay's API with no try/except of its own -- a failure
+        # there (or anywhere up through the agent loop) used to propagate
+        # straight out of this function with NOTHING logged: not a scored
+        # outcome, not even a needs_manual_review fallback like every other
+        # failure mode in the agent path gets (see agent/risk_agent.py's
+        # _finalize, hardened for a different failure point in an earlier
+        # fix). app/dashboard.py's UI layer catches the exception and shows
+        # an error banner, but until now that attempted investigation left
+        # zero trace in the one place this project's own docstrings
+        # repeatedly promise "every scoring event is written here." Log a
+        # fail-safe manual-review record before letting the error surface,
+        # so the attempt itself is never silently lost -- then re-raise so
+        # the UI's existing error handling still runs unchanged.
+        log_event(
+            conn,
+            merchant_id=merchant_id,
+            input_snapshot={"merchant_id": merchant_id, "amount_rupees": amount_rupees},
+            risk_score=None,
+            top_factors=None,
+            explanation=None,
+            decision=DECISION_MANUAL_REVIEW,
+            decision_reason="Investigation could not be completed (order creation or agent run failed before finishing) -- routed for manual review.",
+            source="agent_pipeline",
+            agent_proposal=None,
+            agent_trace=None,
+        )
+        raise
 
     event_id = log_event(
         conn,
