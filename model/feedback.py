@@ -305,10 +305,20 @@ def promote_candidate(
     before/after numbers and decides it's actually better.
     """
     os.makedirs(ARTIFACT_DIR, exist_ok=True)
-    joblib.dump(candidate_model, MODEL_PATH)
-    with open(THRESHOLD_PATH, "w") as f:
-        json.dump({"xgboost_threshold": candidate_threshold}, f, indent=2)
 
+    # Every artifact below is first written to a `.tmp_promote` file
+    # alongside its real path, and only swapped into place with os.replace()
+    # (atomic on the same filesystem) once ALL of them have been written
+    # successfully -- see the try/except below. This used to write
+    # joblib.dump(candidate_model, MODEL_PATH) directly to the final path,
+    # as the very first step, followed by four more independent direct
+    # writes with no rollback: a crash partway through (disk full, an
+    # OOM-kill, any interrupted process) left a brand-new model permanently
+    # on disk paired with a STALE decision_threshold.json/metrics.json/
+    # chart_data.json from the previous model. That's not a crash a
+    # reviewer would notice on the next run -- it's a silently wrong gate,
+    # since a threshold tuned for one model's probability distribution gets
+    # applied to a different model's scores with no error anywhere.
     metrics_report = {}
     if os.path.exists(METRICS_PATH):
         with open(METRICS_PATH) as f:
@@ -318,11 +328,6 @@ def promote_candidate(
     metrics_report["xgboost"] = candidate_metrics
     if "baseline_logistic_regression" in metrics_report:
         metrics_report["lift_over_baseline_f1"] = candidate_metrics["f1"] - metrics_report["baseline_logistic_regression"]["f1"]
-    with open(METRICS_PATH, "w") as f:
-        json.dump(metrics_report, f, indent=2)
-
-    if candidate_test_df is not None:
-        candidate_test_df.to_csv(TEST_SNAPSHOT_PATH, index=False)
 
     chart_data = {}
     if os.path.exists(CHART_DATA_PATH):
@@ -331,5 +336,49 @@ def promote_candidate(
     chart_data["confusion_matrix"] = {"labels": ["Not risky", "Risky"], "matrix": candidate_artifacts["confusion_matrix"]}
     chart_data.setdefault("roc_curve", {})["xgboost"] = candidate_artifacts["roc_curve"]
     chart_data["shap_global_importance"] = candidate_artifacts["shap_global_importance"]
-    with open(CHART_DATA_PATH, "w") as f:
-        json.dump(chart_data, f, indent=2)
+
+    pending = {
+        MODEL_PATH: ("joblib", candidate_model),
+        THRESHOLD_PATH: ("json", {"xgboost_threshold": candidate_threshold}),
+        METRICS_PATH: ("json", metrics_report),
+        CHART_DATA_PATH: ("json", chart_data),
+    }
+    if candidate_test_df is not None:
+        pending[TEST_SNAPSHOT_PATH] = ("csv", candidate_test_df)
+
+    # Computed upfront (not appended to as each write succeeds) so the
+    # cleanup below can find every temp path that might exist on disk --
+    # including one left behind by a write that failed PARTWAY THROUGH
+    # itself: `open(tmp_path, "w")` inside the json branch below already
+    # creates the (empty or partially written) file before `json.dump` runs,
+    # so a failure inside that `with` block leaves a real file on disk that
+    # was never going to get recorded by a "track it after it succeeds"
+    # dict -- the first version of this fix cleaned up only successfully
+    # completed temp writes and silently left exactly that kind of orphaned
+    # `.tmp_promote` file behind.
+    tmp_paths = {final_path: f"{final_path}.tmp_promote" for final_path in pending}
+    try:
+        # Phase 1: write every artifact to a temp path. If any write fails
+        # here, none of the real files have been touched yet.
+        for final_path, (kind, payload) in pending.items():
+            tmp_path = tmp_paths[final_path]
+            if kind == "joblib":
+                joblib.dump(payload, tmp_path)
+            elif kind == "json":
+                with open(tmp_path, "w") as f:
+                    json.dump(payload, f, indent=2)
+            elif kind == "csv":
+                payload.to_csv(tmp_path, index=False)
+
+        # Phase 2: every temp write succeeded -- atomically swap them all
+        # into place. Model and threshold go first and back-to-back (the
+        # pair whose mutual consistency actually drives gating decisions);
+        # the purely-cosmetic report artifacts follow.
+        for final_path in [MODEL_PATH, THRESHOLD_PATH, METRICS_PATH, TEST_SNAPSHOT_PATH, CHART_DATA_PATH]:
+            if final_path in tmp_paths:
+                os.replace(tmp_paths[final_path], final_path)
+    except Exception:
+        for tmp_path in tmp_paths.values():
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        raise

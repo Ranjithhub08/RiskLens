@@ -166,3 +166,63 @@ def test_promote_candidate_never_touches_the_real_deployed_model(tmp_path, monke
         assert chart_data["confusion_matrix"]["matrix"] == [[80, 10], [5, 5]]
         assert chart_data["roc_curve"]["xgboost"]["auc"] == 0.7
         assert chart_data["shap_global_importance"][0]["feature"] == "account_age_days"
+
+
+def test_promote_candidate_leaves_no_partial_state_on_mid_promotion_failure(tmp_path, monkeypatch):
+    """Regression test: promote_candidate used to write
+    joblib.dump(candidate_model, MODEL_PATH) directly to the final path as
+    its very first step, followed by four more independent direct writes
+    with no rollback -- a crash partway through left a brand-new model
+    permanently on disk paired with STALE threshold/metrics/chart_data from
+    the previous model (a silently wrong gate, not a visible crash). Every
+    artifact is now written to a temp file first and swapped into place
+    only after every temp write succeeds, so a failure partway through must
+    leave the real files completely untouched."""
+    fake_model_path = tmp_path / "candidate_model.joblib"
+    fake_threshold_path = tmp_path / "candidate_threshold.json"
+    fake_metrics_path = tmp_path / "metrics.json"
+    fake_chart_data_path = tmp_path / "chart_data.json"
+    monkeypatch.setattr(feedback_module, "MODEL_PATH", str(fake_model_path))
+    monkeypatch.setattr(feedback_module, "THRESHOLD_PATH", str(fake_threshold_path))
+    monkeypatch.setattr(feedback_module, "METRICS_PATH", str(fake_metrics_path))
+    monkeypatch.setattr(feedback_module, "CHART_DATA_PATH", str(fake_chart_data_path))
+    monkeypatch.setattr(feedback_module, "ARTIFACT_DIR", str(tmp_path))
+
+    # Pre-existing "old model's" artifacts -- these must survive untouched.
+    fake_model_path.write_text("OLD MODEL BYTES")
+    fake_threshold_path.write_text(json.dumps({"xgboost_threshold": 0.50}))
+    fake_metrics_path.write_text(json.dumps({"xgboost": {"f1": 0.1}}))
+    fake_chart_data_path.write_text(json.dumps({"confusion_matrix": {"matrix": [[1, 0], [0, 1]]}}))
+
+    real_json_dump = json.dump
+    call_count = {"n": 0}
+
+    def flaky_json_dump(obj, fp, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 3:  # the chart_data temp write, after model/threshold/metrics temp writes already succeeded
+            raise OSError("simulated crash mid-promotion")
+        return real_json_dump(obj, fp, **kwargs)
+
+    monkeypatch.setattr(feedback_module.json, "dump", flaky_json_dump)
+
+    candidate_metrics = {"threshold": 0.61, "precision": 0.5, "recall": 0.5, "f1": 0.5, "roc_auc": 0.7}
+    candidate_artifacts = {
+        "test_rows": 100,
+        "test_positive_rate": 0.1,
+        "confusion_matrix": [[80, 10], [5, 5]],
+        "roc_curve": {"fpr": [0.0, 1.0], "tpr": [0.0, 1.0], "auc": 0.7},
+        "shap_global_importance": [{"feature": "account_age_days", "mean_abs_shap": 0.2}],
+    }
+
+    with pytest.raises(OSError, match="simulated crash"):
+        promote_candidate(DummyModel(), 0.61, candidate_metrics, candidate_artifacts)
+
+    # The real files are exactly what they were before -- the old model, not
+    # a new model silently paired with a stale threshold.
+    assert fake_model_path.read_text() == "OLD MODEL BYTES"
+    assert json.loads(fake_threshold_path.read_text())["xgboost_threshold"] == 0.50
+    assert json.loads(fake_metrics_path.read_text())["xgboost"]["f1"] == 0.1
+    assert json.loads(fake_chart_data_path.read_text())["confusion_matrix"]["matrix"] == [[1, 0], [0, 1]]
+
+    # No leftover temp files from the failed attempt.
+    assert list(tmp_path.glob("*.tmp_promote")) == []
