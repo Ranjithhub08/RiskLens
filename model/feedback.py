@@ -23,7 +23,7 @@ from sklearn.metrics import confusion_matrix, roc_curve
 from xgboost import XGBClassifier
 
 from audit.audit_log import get_all_overrides, get_event_by_id
-from features.features import RAW_REQUIRED_COLUMNS, transform_features
+from features.features import RAW_REQUIRED_COLUMNS, find_missing_or_invalid, transform_features
 from gating.decision_engine import DECISION_CLEAR
 from model.train import (
     RAW_DATA_PATH,
@@ -96,10 +96,27 @@ def build_feedback_rows(conn) -> pd.DataFrame:
     model's binary target -- the same simplification the deterministic gate
     already makes by thresholding a single risk probability.
 
-    Overrides whose original event can't be found, or whose feature row is
+    Overrides whose original event can't be found, whose feature row is
     incomplete (e.g. an agent case where get_merchant_context was never
-    called), are skipped rather than guessed at -- see skipped_count on the
-    caller side if you need to report how many were dropped.
+    called), or whose kyc_status/business_category isn't a value the model
+    actually recognizes (e.g. a typo that reached us through the batch-CSV
+    or API paths, which don't constrain those fields to a dropdown the way
+    the manual-entry form does) are skipped rather than guessed at -- see
+    skipped_count on the caller side if you need to report how many were
+    dropped.
+
+    That second check matters because this is exactly the situation
+    find_missing_or_invalid was built for: a case with an unrecognized
+    category originally failed to score at all and was routed to manual
+    review with risk_score=None -- but a human reviewer can still override
+    ANY case's decision (see app/dashboard.py's render_override_section),
+    including one like this. Without re-validating here, that override
+    would carry its invalid category straight into a retrain: since the
+    value is present (not None), the None-check above wouldn't catch it,
+    and transform_features would one-hot-encode it as all-zero -- a
+    merchant that silently belongs to no business category at all -- the
+    same silent-corruption failure mode this function's docstring already
+    guards against, just reachable through this second path instead.
     """
     rows = []
     for override in get_all_overrides(conn):
@@ -108,6 +125,8 @@ def build_feedback_rows(conn) -> pd.DataFrame:
             continue
         features = _extract_features_from_event(event)
         if any(features.get(col) is None for col in RAW_REQUIRED_COLUMNS):
+            continue
+        if find_missing_or_invalid(pd.DataFrame([features])):
             continue
         features["is_risky"] = 0 if override["overridden_decision"] == DECISION_CLEAR else 1
         features["snapshot_date"] = override["timestamp_utc"]
