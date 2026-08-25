@@ -537,7 +537,17 @@ def agent_recommendation_card_html(agent_proposal) -> str:
     used where compare_panel_html's combined block would be too large a
     single unit for a balanced layout (e.g. a CSS masonry grid)."""
     agent_decision = (agent_proposal or {}).get("recommended_decision")
-    agent_style = DECISION_STYLE.get(agent_decision, {"color": TEXT_MUTED, "label": (agent_decision or "No proposal")})
+    # submit_decision's tool schema declares recommended_decision as a fixed
+    # enum (agent/tools.py), but that enum is a hint to the model, not a
+    # server-side guarantee every provider enforces -- so when agent_decision
+    # isn't one of the 4 known decisions, this label falls back to whatever
+    # string the LLM actually returned instead of always being a value this
+    # app controls. Same reasoning as the escaping below: escape it too,
+    # rather than assume tool-call output is as trustworthy as the gate's own
+    # decision strings (which unlike this one really are always one of the
+    # 4 fixed constants, since Python code produces them, not an LLM).
+    fallback_label = html.escape(str(agent_decision)) if agent_decision else "No proposal"
+    agent_style = DECISION_STYLE.get(agent_decision, {"color": TEXT_MUTED, "label": fallback_label})
     # The agent's reasoning is LLM-generated text, not a fixed template like
     # the gate's reason strings -- and the transaction it reasons about
     # includes the merchant_id a user typed in, unconstrained, on the Live
