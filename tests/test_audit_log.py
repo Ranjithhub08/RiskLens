@@ -120,6 +120,37 @@ def test_get_overrides_for_event_filters_and_orders_correctly(temp_conn):
     assert overrides[0]["overridden_decision"] == "flag_for_compliance_review"
 
 
+def test_get_overrides_for_event_breaks_timestamp_ties_by_insertion_order(temp_conn):
+    """Regression test: get_overrides_for_event/get_all_overrides/
+    get_all_events/get_events_for_merchant all order by timestamp_utc DESC
+    alone used to have no tiebreaker. Two overrides landing in the same
+    microsecond (a scripted burst, or two rapid clicks) get an identical
+    ISO timestamp string, and SQLite then returns tied rows in their
+    on-disk (insertion) order under DESC -- the OLDER of the two ties would
+    sort FIRST, which model/feedback.py's override-dedup fix and the
+    dashboard's override-history display both silently depend on being
+    false. Insert two overrides with an identical timestamp_utc directly
+    (bypassing log_override's real-clock timestamp so the tie is
+    deterministic) and confirm the later INSERT still sorts first."""
+    event_id = log_event(temp_conn, "M1", {"a": 1}, 0.85, None, "e", "escalate", "r")
+    tied_ts = "2026-01-01T00:00:00+00:00"
+    temp_conn.execute(
+        "INSERT INTO human_overrides (override_id, event_id, timestamp_utc, original_decision, overridden_decision, reason) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("override-1-first-mistaken", event_id, tied_ts, "escalate", "escalate", "first, mistaken"),
+    )
+    temp_conn.execute(
+        "INSERT INTO human_overrides (override_id, event_id, timestamp_utc, original_decision, overridden_decision, reason) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("override-2-correction", event_id, tied_ts, "escalate", "clear", "self-corrected"),
+    )
+    temp_conn.commit()
+
+    overrides = get_overrides_for_event(temp_conn, event_id)
+    assert len(overrides) == 2
+    assert overrides[0]["override_id"] == "override-2-correction"
+
+
 def test_get_all_overrides_returns_every_override(temp_conn):
     e1 = log_event(temp_conn, "M1", {"a": 1}, 0.85, None, "e", "escalate", "r")
     e2 = log_event(temp_conn, "M2", {"a": 2}, 0.2, None, "e", "clear", "r")

@@ -121,9 +121,22 @@ def log_event(
     return event_id
 
 
+# Every "most recent first" query in this module orders by timestamp_utc
+# DESC with rowid DESC as a tiebreaker. timestamp_utc alone isn't a strict
+# ordering: two writes landing in the same microsecond (a scripted burst, or
+# two rapid override clicks) get an identical ISO string, and SQLite then
+# falls back to returning tied rows in their on-disk (insertion) order under
+# DESC -- the OLDER of the two ties would sort first, backwards from what
+# every caller of these functions assumes ("most recent" for the dashboard's
+# override-history display, "latest verdict" for model/feedback.py's
+# override dedup). rowid strictly increases with insertion order and is
+# never reused (these tables use a TEXT PRIMARY KEY, not
+# `INTEGER PRIMARY KEY`, so it doesn't get aliased away), so ordering by it
+# as a tiebreaker resolves ties in true insertion order regardless of
+# timestamp resolution.
 def get_all_events(conn, limit: int = 500):
     cur = conn.execute(
-        "SELECT * FROM audit_events ORDER BY timestamp_utc DESC LIMIT ?", (limit,)
+        "SELECT * FROM audit_events ORDER BY timestamp_utc DESC, rowid DESC LIMIT ?", (limit,)
     )
     columns = [d[0] for d in cur.description]
     return [dict(zip(columns, row)) for row in cur.fetchall()]
@@ -142,7 +155,7 @@ def get_event_by_id(conn, event_id: str):
 
 def get_events_for_merchant(conn, merchant_id, limit: int = 100):
     cur = conn.execute(
-        "SELECT * FROM audit_events WHERE merchant_id = ? ORDER BY timestamp_utc DESC LIMIT ?",
+        "SELECT * FROM audit_events WHERE merchant_id = ? ORDER BY timestamp_utc DESC, rowid DESC LIMIT ?",
         (str(merchant_id), limit),
     )
     columns = [d[0] for d in cur.description]
@@ -181,7 +194,7 @@ def log_override(conn, event_id: str, original_decision: str, overridden_decisio
 
 def get_overrides_for_event(conn, event_id: str, limit: int = 20):
     cur = conn.execute(
-        "SELECT * FROM human_overrides WHERE event_id = ? ORDER BY timestamp_utc DESC LIMIT ?",
+        "SELECT * FROM human_overrides WHERE event_id = ? ORDER BY timestamp_utc DESC, rowid DESC LIMIT ?",
         (str(event_id), limit),
     )
     columns = [d[0] for d in cur.description]
@@ -192,6 +205,6 @@ def get_all_overrides(conn, limit: int = 1000):
     """Every override ever recorded, most recent first -- the raw material for
     a feedback-driven retrain: each row says what the model/gate originally
     decided, what a human corrected it to, and why."""
-    cur = conn.execute("SELECT * FROM human_overrides ORDER BY timestamp_utc DESC LIMIT ?", (limit,))
+    cur = conn.execute("SELECT * FROM human_overrides ORDER BY timestamp_utc DESC, rowid DESC LIMIT ?", (limit,))
     columns = [d[0] for d in cur.description]
     return [dict(zip(columns, row)) for row in cur.fetchall()]
