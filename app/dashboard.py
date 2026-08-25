@@ -74,9 +74,9 @@ from app.theme import (
 )
 from audit.audit_log import get_all_events, get_all_overrides, get_connection, get_overrides_for_event, log_override
 from explainability.explain import RiskExplainer
-from features.features import BUSINESS_CATEGORIES, RAW_REQUIRED_COLUMNS
+from features.features import BUSINESS_CATEGORIES, RAW_REQUIRED_COLUMNS, transform_features
 from gating.decision_engine import DECISION_CLEAR, DECISION_ESCALATE, DECISION_FLAG, DECISION_MANUAL_REVIEW, GATE_VERSION
-from model.feedback import promote_candidate, train_candidate_with_feedback
+from model.feedback import TEST_SNAPSHOT_PATH, promote_candidate, train_candidate_with_feedback
 from model.train import load_and_split
 from pipeline import load_model, score_record
 
@@ -1099,9 +1099,28 @@ def _test_set_predictions():
     currently loaded. Deliberately NOT cached -- if a candidate was just
     promoted (see render_retrain_from_feedback_section), get_model_and_explainer
     is cleared and `model` is reloaded from disk on the rerun, so this should
-    always reflect what's actually deployed right now, not a stale snapshot."""
-    splits = load_and_split()
-    X_test, y_test = splits["test"]
+    always reflect what's actually deployed right now, not a stale snapshot.
+
+    Prefers TEST_SNAPSHOT_PATH (the exact raw rows promote_candidate last
+    evaluated the deployed model on) over re-deriving a split from
+    data/raw/merchant_snapshots.csv via load_and_split(). Those two stop
+    being the same test set the moment any feedback-retrained model gets
+    promoted: combining in human-override rows and re-sorting by date shifts
+    where the train/val/test boundaries fall, so load_and_split() alone
+    would silently score the deployed model against a different set of rows
+    (and a different row count) than the one its own metrics.json/
+    chart_data.json were computed from -- two panels on this same page
+    disagreeing about the same model at the same threshold. Falling back to
+    load_and_split() when no snapshot file exists yet is still exactly
+    correct for a model that's never been retrained with feedback, since
+    that's precisely the split model/train.py used to produce it."""
+    if os.path.exists(TEST_SNAPSHOT_PATH):
+        test_df = pd.read_csv(TEST_SNAPSHOT_PATH)
+        X_test = transform_features(test_df)
+        y_test = test_df["is_risky"].values
+    else:
+        splits = load_and_split()
+        X_test, y_test = splits["test"]
     probs = model.predict_proba(X_test)[:, 1]
     return y_test, probs
 
@@ -1227,7 +1246,13 @@ def render_retrain_from_feedback_section():
         st.caption("The candidate doesn't beat the deployed model's F1 on this test split -- promoting it anyway is your call, not a recommendation.")
 
     if st.button("Promote candidate to production", key="promote_candidate_btn", type="primary"):
-        promote_candidate(result["candidate_model"], result["candidate_threshold"], result["candidate_metrics"], result["candidate_artifacts"])
+        promote_candidate(
+            result["candidate_model"],
+            result["candidate_threshold"],
+            result["candidate_metrics"],
+            result["candidate_artifacts"],
+            candidate_test_df=result["candidate_test_df"],
+        )
         get_model_and_explainer.clear()  # so the app picks up the new model immediately, not just after a restart
         st.session_state["_retrain_result"] = None
         st.success("Candidate promoted -- RiskLens is now scoring with the retrained model.")

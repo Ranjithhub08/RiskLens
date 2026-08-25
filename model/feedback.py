@@ -38,6 +38,14 @@ MODEL_PATH = os.path.join(ARTIFACT_DIR, "xgb_model.joblib")
 THRESHOLD_PATH = os.path.join(ARTIFACT_DIR, "decision_threshold.json")
 METRICS_PATH = os.path.join(ARTIFACT_DIR, "metrics.json")
 CHART_DATA_PATH = os.path.join(ARTIFACT_DIR, "chart_data.json")
+# The raw (pre-transform) held-out test rows that actually produced whatever
+# model is currently deployed. Written by promote_candidate, read by the
+# dashboard's Threshold Explorer (see app/dashboard.py's _test_set_predictions)
+# instead of it independently re-deriving a test split from
+# data/raw/merchant_snapshots.csv -- see promote_candidate's docstring for why
+# that independent re-derivation goes stale the moment feedback rows are
+# involved.
+TEST_SNAPSHOT_PATH = os.path.join(ARTIFACT_DIR, "deployed_test_snapshot.csv")
 
 
 def _extract_features_from_event(event: dict) -> dict:
@@ -221,6 +229,11 @@ def train_candidate_with_feedback(conn) -> dict:
         "candidate_metrics": candidate_metrics,
         "candidate_model": candidate,
         "candidate_threshold": candidate_threshold,
+        # Raw (pre-transform) test rows -- exactly what X_test/y_test above
+        # were derived from. Passed through to promote_candidate so it can be
+        # persisted alongside the model: see TEST_SNAPSHOT_PATH's comment for
+        # why the dashboard needs this rather than re-deriving a test split.
+        "candidate_test_df": test_df,
         "candidate_artifacts": {
             "test_rows": len(X_test),
             "test_positive_rate": float(y_test.mean()),
@@ -231,7 +244,13 @@ def train_candidate_with_feedback(conn) -> dict:
     }
 
 
-def promote_candidate(candidate_model, candidate_threshold: float, candidate_metrics: dict, candidate_artifacts: dict) -> None:
+def promote_candidate(
+    candidate_model,
+    candidate_threshold: float,
+    candidate_metrics: dict,
+    candidate_artifacts: dict,
+    candidate_test_df: pd.DataFrame = None,
+) -> None:
     """
     Explicit, human-triggered step: overwrite the live model + threshold
     with a candidate that's already been reviewed, AND refresh the Models
@@ -241,6 +260,24 @@ def promote_candidate(candidate_model, candidate_threshold: float, candidate_met
     bug even though it's actually cosmetic staleness. The baseline logistic
     regression comparison is left untouched since it wasn't retrained here;
     only the XGBoost side of the report changes.
+
+    candidate_test_df (the raw rows train_candidate_with_feedback actually
+    evaluated this candidate on) is persisted to TEST_SNAPSHOT_PATH for the
+    same reason: once feedback rows are mixed in and the combined data is
+    re-sorted by date and re-split, that test partition is no longer the
+    same rows -- or even the same row COUNT -- as an independent call to
+    model/train.py's load_and_split() would produce from the original raw
+    CSV alone. Without persisting it, the dashboard's Threshold Explorer
+    (which needs raw per-row predictions to answer "what if the threshold
+    were X", not just the single aggregate confusion matrix/ROC curve saved
+    above) would keep re-deriving its own, now-mismatched test set -- so the
+    same page could show two different confusion matrices for the same
+    model at the same threshold, one from this file's real evaluation and
+    one from that stale re-derivation. Optional (defaults to None) so any
+    existing caller that hasn't been updated yet still works; the Threshold
+    Explorer falls back to load_and_split() when no snapshot exists yet,
+    which is exactly correct for a fresh model that was never retrained
+    with feedback.
 
     Deliberately separate from training the candidate -- retraining always
     happens on demand, promoting only happens if a person looks at the
@@ -262,6 +299,9 @@ def promote_candidate(candidate_model, candidate_threshold: float, candidate_met
         metrics_report["lift_over_baseline_f1"] = candidate_metrics["f1"] - metrics_report["baseline_logistic_regression"]["f1"]
     with open(METRICS_PATH, "w") as f:
         json.dump(metrics_report, f, indent=2)
+
+    if candidate_test_df is not None:
+        candidate_test_df.to_csv(TEST_SNAPSHOT_PATH, index=False)
 
     chart_data = {}
     if os.path.exists(CHART_DATA_PATH):
