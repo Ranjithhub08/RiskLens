@@ -1275,8 +1275,18 @@ def render_monitoring_section(events: list):
     isn't adding independent judgment; one that never agrees suggests its
     reasoning has drifted from the rules actually in force).
     """
+    # Overrides are fetched with their own limit (1000) that doesn't match
+    # `events`'s own cap (page_audit_trail passes get_all_events(limit=500))
+    # -- so once the audit log holds more than 500 events, an override
+    # recorded on an older event outside that 500-row window would still
+    # count toward this rate's numerator without that event being part of
+    # the denominator at all. Restricting to overrides whose event_id is
+    # actually IN `events` keeps numerator and denominator counting the
+    # same population, so this can never exceed 100% or attribute an
+    # override to a case this page isn't even showing.
+    event_ids_in_view = {e["event_id"] for e in events}
     overrides = get_all_overrides(conn, limit=1000)
-    overridden_ids = {o["event_id"] for o in overrides}
+    overridden_ids = {o["event_id"] for o in overrides if o["event_id"] in event_ids_in_view}
     override_rate = len(overridden_ids) / len(events) if events else 0.0
 
     agent_events = [e for e in events if (e.get("source") or "rule_pipeline") == "agent_pipeline"]
