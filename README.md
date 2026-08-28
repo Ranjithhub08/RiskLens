@@ -70,10 +70,10 @@ uvicorn api.main:app --reload --port 8000
 - `agent/` — the agentic layer: `risk_agent.py` (the LLM reasoning loop, via Groq function calling, with a timestamped/timed tool-call trace and live step-by-step streaming), `tools.py` (what the agent is allowed to call, including looking up similar past cases), `merchant_context.py` (simulated merchant history), `case_qa.py` (read-only natural-language Q&A grounded in one case's own data, no tools, no actions)
 - `integrations/razorpay_client.py` — real calls to Razorpay's test-mode API (Order creation)
 - `agent_pipeline.py` — the agentic scoring pipeline (Razorpay + agent + gate + audit), used by the Live Agent page
-- `config.py` — loads `GROQ_API_KEY` / `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` from a local `.env` file (see `.env.example`) — never hardcoded, never committed
+- `config.py` — loads `GROQ_API_KEY` / `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` from a local `.env` file (see `.env.example`) — never hardcoded, never committed. Also refuses to start against a live-mode Razorpay key (anything not prefixed `rzp_test_`) — this is a test-mode-only demo by design, not just by convention.
 - `app/dashboard.py` + `app/theme.py` — the console UI: a native sidebar-navigated app (Overview, Investigations, Batch Scoring, Live Agent, Models, Audit Trail) with real, interactive (Altair) charts throughout
-- `api/main.py` — optional FastAPI `/score` endpoint
-- `tests/` — 53 tests covering feature engineering, gating logic, the audit log and override table, the deterministic pipeline, the agent loop, the case Q&A, and the feedback/retrain flow (with a scripted fake LLM client so the suite runs offline) (`pytest tests/`)
+- `api/main.py` — optional FastAPI `/score` endpoint, opening a fresh database connection per request so concurrent requests can't corrupt each other's audit rows
+- `tests/` — 91 tests covering feature engineering, gating logic (including NaN/boundary handling), the audit log and override table (including tie-break ordering), the deterministic pipeline, the agentic pipeline (including a Razorpay-failure case that must still reach the audit log), the agent loop, the case Q&A, the feedback/retrain flow with atomic all-or-nothing promotion, the dashboard's HTML-escaping of untrusted fields, the live-vs-test Razorpay key guard, and concurrent API load (with a scripted fake LLM client so the suite runs fully offline) (`pytest tests/`)
 
 ## What's real vs. simulated
 

@@ -118,6 +118,10 @@ The thresholds (0.50 / 0.62) are configuration, not hard-coded logic — deliber
 - **Out-of-range values:** clipped/flagged rather than crashing the pipeline.
 - **Low-confidence predictions:** a configurable confidence floor (e.g., predictions between 0.45–0.55, close to the decision boundary) are also routed to manual review rather than trusted outright — the model admits uncertainty instead of forcing a decision.
 - **Model/data drift:** full statistical drift detection (e.g. tracking the incoming score distribution against the training distribution) is not implemented. What *is* implemented is an operational proxy for the same concern — the System Monitoring section (Section 12.5) surfaces the human override rate and the agent/gate agreement rate over time, both of which are early, human-interpretable signals that something about the model or the data has shifted, without requiring a separate drift-detection subsystem.
+- **Untrusted display data:** every field that can contain arbitrary text and reaches the dashboard as raw HTML — a merchant ID typed into a batch upload, an override reason, an LLM tool name or argument from the agent's own trace — is HTML-escaped before rendering. Nothing an uploaded file or an LLM response contains can inject markup into the case detail panel or the Live Agent timeline.
+- **Model promotion is all-or-nothing:** `model/feedback.py`'s `promote_candidate` writes every artifact (model, threshold, metrics, chart data, test snapshot) to temporary files first and only swaps them into place, atomically, once every write has succeeded — a crash or disk error mid-promotion leaves the previously-live model untouched rather than a mismatched model/threshold pair.
+- **Concurrent scoring is safe:** `api/main.py`'s `/score` endpoint opens and closes its own database connection per request instead of sharing one across FastAPI's thread pool, so concurrent requests can't silently drop each other's audit rows (`tests/test_api.py` fires 80 concurrent requests and checks every one lands durably).
+- **Live-key guard:** `config.py` refuses to start if `RAZORPAY_KEY_ID` doesn't look like a test-mode key (`rzp_test_...`) — a fail-safe against ever accidentally pointing this demo at a live Razorpay account.
 
 ## 7. Evaluation Methodology
 
@@ -160,14 +164,20 @@ risklens/
 ├── .streamlit/
 │   └── config.toml                          # fixed light theme (native widgets otherwise follow OS dark mode)
 ├── api/                                    # optional
-│   └── main.py                              # FastAPI /score endpoint
-├── tests/
+│   └── main.py                              # FastAPI /score endpoint (fresh DB connection per request)
+├── tests/                                     # 91 tests total, pytest tests/
 │   ├── test_features.py
-│   ├── test_gating.py
-│   ├── test_audit_log.py
+│   ├── test_gating.py                           # incl. NaN scores and float boundary handling
+│   ├── test_audit_log.py                         # incl. tie-break ordering on identical timestamps
 │   ├── test_pipeline.py
-│   ├── test_agent.py                          # agent loop tests, scripted fake LLM client
-│   └── test_feedback.py                        # override -> training row mapping, promotion safety
+│   ├── test_agent.py                              # agent loop tests, scripted fake LLM client
+│   ├── test_agent_pipeline.py                      # Razorpay order-creation failure still reaches the audit log
+│   ├── test_case_qa.py                              # incl. prompt-injection-in-case-data guard
+│   ├── test_config.py                                # live-vs-test Razorpay key guard
+│   ├── test_theme.py                                  # NaN/inf-safe score display
+│   ├── test_dashboard.py                               # HTML-escaping of untrusted case/agent fields
+│   ├── test_api.py                                      # concurrent /score requests, no lost audit rows
+│   └── test_feedback.py                                  # override -> training row mapping, atomic promotion
 ├── docs/
 │   └── ARCHITECTURE.md                          # this document
 ├── .env.example                                   # template for local secrets (never committed)
