@@ -1,0 +1,33 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate the synthetic dataset
+        run: python3 data/raw/generate_data.py
+
+      - name: Train the model (produces the artifacts the dashboard/tests use)
+        run: python3 model/train.py
+
+      - name: Run the test suite
+        run: pytest tests/ -v

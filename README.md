@@ -1,5 +1,7 @@
 # RiskLens
 
+[![Tests](https://github.com/Ranjithhub08/RiskLens/actions/workflows/tests.yml/badge.svg)](https://github.com/Ranjithhub08/RiskLens/actions/workflows/tests.yml)
+
 **Explainable, accountable merchant risk & freeze-advisory engine — built for the Razorpay AI Buildathon, AI Risk Manager track.**
 
 RiskLens scores merchant/transaction risk, explains every score in plain language, and never takes an irreversible action on its own. It classifies into clear / escalate / flag / needs-manual-review, always with a reason, and logs every decision to an append-only audit trail.
@@ -9,6 +11,16 @@ It ships two ways to reach that decision: a **deterministic pipeline** for insta
 That's the scoring half. The other half is what happens *after* a decision is made: a human reviewer can override any decision with a reason, on the record, without erasing the original; those corrections become labeled feedback; a candidate model can be retrained on that feedback and compared against what's live, with promotion to production always a separate, deliberate, human-triggered step. A monitoring view tracks how often that override happens and how often the agent's own recommendation agrees with the gate — so the system's health is visible over time, not just in a single demo run.
 
 Full design rationale, data flow, the agent's reasoning-loop design, and a point-by-point mapping to the buildathon's judging criteria: see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+## Screenshots
+
+| Overview | Investigations |
+|---|---|
+| ![Overview page: portfolio KPIs, risk activity and distribution charts, recent investigations](docs/screenshots/overview.png) | ![Investigations page: searchable, filterable case table](docs/screenshots/investigations.png) |
+
+| Live Agent | Model performance |
+|---|---|
+| ![Live Agent page: run a real Razorpay test-mode investigation](docs/screenshots/live_agent.png) | ![Models page: XGBoost vs. logistic-regression baseline, ROC curve, confusion matrix](docs/screenshots/models.png) |
 
 ## Feature highlights
 
@@ -82,3 +94,7 @@ The model, explainability layer, gating logic, and audit trail are fully functio
 ## Security note
 
 `.env` is listed in `.gitignore` and will never be committed. If you ever paste an API key into a chat, a script, or a public repo, treat it as compromised and regenerate it immediately.
+
+## License
+
+[MIT](LICENSE)
