@@ -10,6 +10,8 @@ pulled out of render_case_detail specifically so this escaping logic is
 testable without a running Streamlit app.
 """
 
+import pandas as pd
+
 import app.dashboard as dashboard
 
 BASE_VIEW = {
@@ -123,3 +125,17 @@ def test_none_values_render_as_placeholder():
                 daily_txn_volume=None, avg_30d_txn_volume=None, avg_ticket_size=None)
     ctx = dashboard.merchant_context_display_values(view)
     assert all(v == "—" for v in ctx.values())
+
+
+def test_audit_trail_merchant_search_does_not_crash_on_regex_metacharacters():
+    # page_audit_trail()'s "Search merchant ID" box filters with this exact
+    # pandas expression. It's a plain free-text field (the sibling search on
+    # Investigations does plain substring matching), but str.contains
+    # defaults to regex=True -- so a merchant ID a reviewer actually types,
+    # like "test(store)", contains an unbalanced paren that used to raise
+    # and crash the whole Audit Trail page instead of just finding no match.
+    merchant_ids = pd.Series(["test(store)", "other_merchant", "TEST(STORE)_2"])
+
+    matches = merchant_ids.astype(str).str.contains("test(", case=False, na=False, regex=False)
+
+    assert list(matches) == [True, False, True]

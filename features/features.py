@@ -133,6 +133,28 @@ def find_missing_or_invalid(df: pd.DataFrame) -> list:
                 continue
             if not np.isfinite(num) or num < 0:
                 problems.append(col)
+    # Cross-field check: chargebacks/refunds can never exceed the total
+    # transaction count they're drawn from. Each field passes the
+    # individual non-negative check above on its own (e.g.
+    # chargebacks_30d=500, total_txns_30d=1 are each independently a valid
+    # non-negative number), but together they produce a chargeback_rate
+    # far outside anything the model saw in training -- the same class of
+    # "value the model has never seen" problem that
+    # agent/merchant_context.py already guards against for *simulated*
+    # merchants, but which nothing previously caught for a real batch
+    # upload row, manual investigation form entry, or agent tool call.
+    if "chargebacks_30d" not in problems and "total_txns_30d" not in problems:
+        try:
+            if float(df["chargebacks_30d"].iloc[0]) > float(df["total_txns_30d"].iloc[0]):
+                problems.append("chargebacks_30d")
+        except (TypeError, ValueError):
+            pass
+    if "refunds_30d" not in problems and "total_txns_30d" not in problems:
+        try:
+            if float(df["refunds_30d"].iloc[0]) > float(df["total_txns_30d"].iloc[0]):
+                problems.append("refunds_30d")
+        except (TypeError, ValueError):
+            pass
     return problems
 
 

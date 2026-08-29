@@ -152,3 +152,31 @@ def test_find_missing_or_invalid_allows_zero_numeric_fields():
 def test_find_missing_or_invalid_empty_on_valid_row():
     df = pd.DataFrame([VALID_ROW])
     assert find_missing_or_invalid(df) == []
+
+
+def test_find_missing_or_invalid_flags_chargebacks_exceeding_total_txns():
+    # Each field is individually a valid non-negative number, but
+    # chargebacks_30d > total_txns_30d is impossible -- you can't have more
+    # chargebacks than transactions. Without a cross-field check this would
+    # flow straight into chargeback_rate as e.g. 500.0 (50,000%), a value
+    # nowhere near anything the model saw in training.
+    row = dict(VALID_ROW, chargebacks_30d=500, total_txns_30d=1)
+    df = pd.DataFrame([row])
+    problems = find_missing_or_invalid(df)
+    assert "chargebacks_30d" in problems
+    assert "total_txns_30d" not in problems  # total_txns_30d=1 is valid on its own
+
+
+def test_find_missing_or_invalid_flags_refunds_exceeding_total_txns():
+    row = dict(VALID_ROW, refunds_30d=50, total_txns_30d=3)
+    df = pd.DataFrame([row])
+    problems = find_missing_or_invalid(df)
+    assert "refunds_30d" in problems
+
+
+def test_find_missing_or_invalid_allows_chargebacks_equal_to_total_txns():
+    # Every single transaction charging back is unusual but not impossible
+    # -- equal should be allowed, only strictly greater is invalid.
+    row = dict(VALID_ROW, chargebacks_30d=3, total_txns_30d=3, refunds_30d=0)
+    df = pd.DataFrame([row])
+    assert find_missing_or_invalid(df) == []

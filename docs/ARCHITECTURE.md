@@ -122,6 +122,8 @@ The thresholds (0.50 / 0.62) are configuration, not hard-coded logic — deliber
 - **Model promotion is all-or-nothing:** `model/feedback.py`'s `promote_candidate` writes every artifact (model, threshold, metrics, chart data, test snapshot) to temporary files first and only swaps them into place, atomically, once every write has succeeded — a crash or disk error mid-promotion leaves the previously-live model untouched rather than a mismatched model/threshold pair.
 - **Concurrent scoring is safe:** `api/main.py`'s `/score` endpoint opens and closes its own database connection per request instead of sharing one across FastAPI's thread pool, so concurrent requests can't silently drop each other's audit rows (`tests/test_api.py` fires 80 concurrent requests and checks every one lands durably).
 - **Live-key guard:** `config.py` refuses to start if `RAZORPAY_KEY_ID` doesn't look like a test-mode key (`rzp_test_...`) — a fail-safe against ever accidentally pointing this demo at a live Razorpay account.
+- **Cross-field input validation:** `features/features.py`'s shared validation gate checks not just that `chargebacks_30d`/`refunds_30d` are individually non-negative, but that neither one exceeds `total_txns_30d` — a batch upload row, manual form entry, or hallucinated agent tool call with e.g. 500 chargebacks against 1 total transaction fails safe to manual review instead of producing a chargeback_rate the model never saw in training.
+- **Crash-safe free-text search:** the Audit Trail page's merchant-ID search does a plain literal substring match rather than treating the typed text as a regular expression, so a merchant ID containing a regex metacharacter (e.g. an unbalanced parenthesis) can't crash the page.
 
 ## 7. Evaluation Methodology
 
@@ -165,8 +167,8 @@ risklens/
 │   └── config.toml                          # fixed light theme (native widgets otherwise follow OS dark mode)
 ├── api/                                    # optional
 │   └── main.py                              # FastAPI /score endpoint (fresh DB connection per request)
-├── tests/                                     # 91 tests total, pytest tests/
-│   ├── test_features.py
+├── tests/                                     # 95 tests total, pytest tests/
+│   ├── test_features.py                         # incl. chargebacks/refunds can't exceed total_txns_30d
 │   ├── test_gating.py                           # incl. NaN scores and float boundary handling
 │   ├── test_audit_log.py                         # incl. tie-break ordering on identical timestamps
 │   ├── test_pipeline.py
@@ -175,7 +177,7 @@ risklens/
 │   ├── test_case_qa.py                              # incl. prompt-injection-in-case-data guard
 │   ├── test_config.py                                # live-vs-test Razorpay key guard
 │   ├── test_theme.py                                  # NaN/inf-safe score display
-│   ├── test_dashboard.py                               # HTML-escaping of untrusted case/agent fields
+│   ├── test_dashboard.py                               # HTML-escaping + crash-safe Audit Trail search
 │   ├── test_api.py                                      # concurrent /score requests, no lost audit rows
 │   └── test_feedback.py                                  # override -> training row mapping, atomic promotion
 ├── docs/

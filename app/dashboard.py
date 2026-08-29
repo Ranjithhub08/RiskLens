@@ -271,9 +271,11 @@ def merchant_context_display_values(view: dict) -> dict:
     reachable via the same batch-CSV path as merchant_id -- a row whose
     business_category fails the allow-list check in find_missing_or_invalid
     is still logged and still displayed here, not discarded. chargebacks_30d
-    /refunds_30d aren't validated at all (find_missing_or_invalid has no
-    bounds/type check for them), so they need the same escaping even though
-    they "look" numeric.
+    /refunds_30d are range-checked (non-negative, finite, and each no
+    greater than total_txns_30d) but that's a numeric-plausibility check,
+    not an HTML-safety one -- str(2) is exactly as safe to interpolate raw
+    as str("<img src=x onerror=...>"), so both still need the same escaping
+    here even though the former "looks" harmless.
     """
     return {
         "merchant": html.escape(str(view['merchant_id'])) if view['merchant_id'] else '—',
@@ -1452,7 +1454,13 @@ def page_audit_trail():
     if source_filter:
         filtered = filtered[filtered["source"].isin(source_filter)]
     if merchant_search:
-        filtered = filtered[filtered["merchant_id"].astype(str).str.contains(merchant_search, case=False, na=False)]
+        # regex=False: this is a plain-text search box (the placeholder and
+        # sibling search on the Investigations page both imply literal
+        # substring matching), and str.contains defaults to regex=True --
+        # an unbalanced parenthesis or other regex metacharacter in a
+        # merchant ID a reviewer types (e.g. "test(store)") would otherwise
+        # raise and crash the whole page instead of just finding no match.
+        filtered = filtered[filtered["merchant_id"].astype(str).str.contains(merchant_search, case=False, na=False, regex=False)]
 
     display_cols = ["timestamp_utc", "source", "merchant_id", "risk_score", "decision", "decision_reason"]
     st.dataframe(filtered[display_cols], hide_index=True, width="stretch")
