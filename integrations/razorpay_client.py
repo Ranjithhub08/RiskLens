@@ -29,6 +29,22 @@ def get_client() -> razorpay.Client:
     return client
 
 
+# Razorpay's hard limit on the `receipt` field. The Live Agent's Merchant ID
+# text input has no length limit of its own, so a merchant ID longer than
+# ~31 characters (entirely realistic -- a human easily types more than
+# that) previously produced a receipt over 40 characters, and Razorpay's
+# API rejected the ENTIRE order.create call with a BadRequestError. That
+# turned a cosmetic display concern for one field into a hard failure of
+# the whole "Run investigation" flow, on every single click, for any such
+# merchant ID.
+RECEIPT_MAX_LENGTH = 40
+
+
+def build_receipt(merchant_id: str) -> str:
+    """Builds the `receipt` value for order.create, truncated to Razorpay's limit."""
+    return f"risklens-{merchant_id}"[:RECEIPT_MAX_LENGTH]
+
+
 def create_test_order(amount_rupees: float, merchant_id: str, receipt: str = None) -> dict:
     """
     Creates a real Order against Razorpay's test-mode API. Returns the raw
@@ -41,7 +57,7 @@ def create_test_order(amount_rupees: float, merchant_id: str, receipt: str = Non
         {
             "amount": amount_paise,
             "currency": "INR",
-            "receipt": receipt or f"risklens-{merchant_id}",
+            "receipt": (receipt or build_receipt(merchant_id))[:RECEIPT_MAX_LENGTH],
             "notes": {"merchant_id": merchant_id, "source": "RiskLens demo"},
         }
     )

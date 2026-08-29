@@ -127,6 +127,82 @@ def test_none_values_render_as_placeholder():
     assert all(v == "—" for v in ctx.values())
 
 
+def test_resolve_selected_case_returns_none_when_nothing_selected():
+    assert dashboard.resolve_selected_case([], [], []) is None
+
+
+def test_resolve_selected_case_returns_correct_case_when_stable():
+    filtered = [{"event_id": "A"}, {"event_id": "B"}, {"event_id": "C"}]
+    prior_ids = ["A", "B", "C"]
+    assert dashboard.resolve_selected_case(prior_ids, [1], filtered) == {"event_id": "B"}
+
+
+def test_resolve_selected_case_does_not_crash_when_filter_narrows_below_selected_index():
+    # Regression test: selecting row 2 of 3, then a filter/search narrows
+    # `filtered` down to 1 row. Directly indexing filtered[2] used to raise
+    # IndexError and crash the whole Investigations page.
+    prior_ids = ["A", "B", "C"]  # what was on screen when row 2 (event C) was clicked
+    filtered = [{"event_id": "A"}]  # now filtered down to just one case
+    result = dashboard.resolve_selected_case(prior_ids, [2], filtered)
+    assert result is None  # event C is no longer in view -- cleared, not crashed
+
+
+def test_resolve_selected_case_does_not_silently_show_wrong_case_after_reordering():
+    # Regression test: `filtered`'s order shifts (e.g. a new case scored
+    # elsewhere re-sorts "most recent first") without its length changing.
+    # The stale positional index used to silently resolve to a DIFFERENT
+    # case than the one actually clicked.
+    prior_ids = ["A", "B", "C"]  # row 0 (event A) was clicked
+    filtered = [{"event_id": "Z"}, {"event_id": "A"}, {"event_id": "B"}]  # reordered, A is no longer first
+    result = dashboard.resolve_selected_case(prior_ids, [0], filtered)
+    assert result == {"event_id": "A"}  # resolved by stable ID, not by the now-wrong position 0
+
+
+def test_resolve_selected_case_returns_none_for_a_deleted_or_never_seen_event_id():
+    prior_ids = ["A", "B"]
+    filtered = [{"event_id": "C"}]  # neither prior id is in the current view
+    assert dashboard.resolve_selected_case(prior_ids, [0], filtered) is None
+
+
+def test_compute_batch_identity_is_stable_for_the_same_dataframe():
+    df = pd.DataFrame({"merchant_id": ["m1", "m2"], "account_age_days": [100, 200]})
+    assert dashboard.compute_batch_identity(df) == dashboard.compute_batch_identity(df.copy())
+
+
+def test_compute_batch_identity_differs_for_different_dataframes_with_same_shape():
+    # Regression test: a stale-batch-report bug relied on len()/columns
+    # checks, which two DIFFERENT batches of the same shape (e.g. two
+    # 2-row samples) can both satisfy -- the identity must be based on the
+    # actual row contents.
+    df_a = pd.DataFrame({"merchant_id": ["m1", "m2"], "account_age_days": [100, 200]})
+    df_b = pd.DataFrame({"merchant_id": ["m3", "m4"], "account_age_days": [300, 400]})
+    assert dashboard.compute_batch_identity(df_a) != dashboard.compute_batch_identity(df_b)
+
+
+def test_compute_batch_identity_differs_when_a_single_cell_changes():
+    df_a = pd.DataFrame({"merchant_id": ["m1", "m2"], "account_age_days": [100, 200]})
+    df_b = pd.DataFrame({"merchant_id": ["m1", "m2"], "account_age_days": [100, 999]})
+    assert dashboard.compute_batch_identity(df_a) != dashboard.compute_batch_identity(df_b)
+
+
+def test_live_agent_razorpay_error_message_is_escaped_before_rendering():
+    # Regression test: page_live_agent() renders a Razorpay API exception's
+    # str() inside an unsafe_allow_html empty_state_html() block. Razorpay
+    # echoes invalid request parameters (like an attacker-controlled
+    # Merchant ID typed into the Live Agent form) back in its error text,
+    # so this string is exactly as reachable as merchant_id/business_category
+    # elsewhere in this file and must be escaped the same way before being
+    # interpolated into HTML.
+    error_message = "Bad request for merchant " + XSS_PAYLOAD
+    safe_error_message = __import__("html").escape(str(error_message))
+    rendered = dashboard.empty_state_html(
+        "Razorpay API connection failed",
+        f"The test order could not be created or the investigation failed to complete.<br><code>{safe_error_message}</code>",
+    )
+    assert "<img" not in rendered
+    assert "&lt;img" in rendered
+
+
 def test_audit_trail_merchant_search_does_not_crash_on_regex_metacharacters():
     # page_audit_trail()'s "Search merchant ID" box filters with this exact
     # pandas expression. It's a plain free-text field (the sibling search on

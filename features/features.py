@@ -73,6 +73,17 @@ _NUMERIC_NONNEGATIVE_COLUMNS = {
     "avg_ticket_size",
 }
 
+# A generous upper bound, nowhere near any real value these fields could
+# take (even a huge merchant's daily volume or ticket size is many orders
+# of magnitude below this), but comfortably inside float32's safe range
+# (~3.4e38). Without it, a finite, non-negative Python float like 1e40 --
+# perfectly valid input as far as the checks above are concerned -- reaches
+# XGBoost's predict_proba() and raises an uncaught XGBoostError ("Input
+# data contains inf or a value too large"), which skips log_event entirely
+# and silently drops the audit trail for that scoring attempt. Rejecting it
+# here instead routes it to manual review like any other invalid field.
+_NUMERIC_MAX = 1e12
+
 
 def find_missing_or_invalid(df: pd.DataFrame) -> list:
     """
@@ -111,6 +122,18 @@ def find_missing_or_invalid(df: pd.DataFrame) -> list:
             problems.append(col)
             continue
         val = df[col].iloc[0] if len(df) else None
+        # val is usually a scalar, but a hallucinated/malformed agent tool
+        # call can hand us a list/tuple/dict/ndarray instead (e.g.
+        # account_age_days: [1, 2, 3]). pd.isna() on a non-scalar returns an
+        # array rather than a bool, and evaluating that array's truthiness
+        # in this `or` chain raises "ValueError: The truth value of an
+        # array... is ambiguous" -- crashing this validation function
+        # instead of the fail-safe result it exists to produce. Anything
+        # that isn't a plain scalar is invalid input regardless, so it's
+        # rejected up front before any of the scalar-only checks below run.
+        if isinstance(val, (list, tuple, dict, set, np.ndarray)):
+            problems.append(col)
+            continue
         if val is None or (isinstance(val, float) and np.isnan(val)) or pd.isna(val):
             problems.append(col)
             continue
@@ -128,10 +151,15 @@ def find_missing_or_invalid(df: pd.DataFrame) -> list:
         if col in _NUMERIC_NONNEGATIVE_COLUMNS:
             try:
                 num = float(val)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
+                # OverflowError: a Python int too large to represent as a
+                # float (e.g. a 400-digit number) raises OverflowError, not
+                # ValueError/TypeError -- the same "fail safe, don't crash"
+                # contract this function makes for every other kind of bad
+                # numeric input applies here too.
                 problems.append(col)
                 continue
-            if not np.isfinite(num) or num < 0:
+            if not np.isfinite(num) or num < 0 or num > _NUMERIC_MAX:
                 problems.append(col)
     # Cross-field check: chargebacks/refunds can never exceed the total
     # transaction count they're drawn from. Each field passes the

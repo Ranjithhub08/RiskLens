@@ -180,3 +180,40 @@ def test_find_missing_or_invalid_allows_chargebacks_equal_to_total_txns():
     row = dict(VALID_ROW, chargebacks_30d=3, total_txns_30d=3, refunds_30d=0)
     df = pd.DataFrame([row])
     assert find_missing_or_invalid(df) == []
+
+
+def test_find_missing_or_invalid_flags_absurdly_large_finite_numeric_value():
+    # A finite, non-negative float like 1e40 is otherwise a "valid" number,
+    # but it's many orders of magnitude past anything real and past
+    # float32's safe range -- XGBoost's predict_proba raises an uncaught
+    # error on a value this large rather than a graceful NaN/prediction.
+    row = dict(VALID_ROW, account_age_days=1e40)
+    df = pd.DataFrame([row])
+    assert "account_age_days" in find_missing_or_invalid(df)
+
+
+def test_find_missing_or_invalid_flags_integer_too_large_for_a_float():
+    # A Python int with hundreds of digits overflows a C double: float(val)
+    # raises OverflowError, not TypeError/ValueError -- this must be caught
+    # by the same except clause as any other malformed numeric value.
+    row = dict(VALID_ROW, chargebacks_30d=int("9" * 400))
+    df = pd.DataFrame([row], dtype=object)
+    assert "chargebacks_30d" in find_missing_or_invalid(df)
+
+
+def test_find_missing_or_invalid_flags_list_valued_field_without_crashing():
+    # A hallucinated/malformed caller (e.g. an LLM tool call) could hand a
+    # list where a scalar is expected. pd.isna() on a list/array returns an
+    # array rather than a bool, and evaluating an array's truthiness raises
+    # ValueError -- this must be rejected as invalid, not crash.
+    row = dict(VALID_ROW, account_age_days=[1, 2, 3])
+    df = pd.DataFrame([row], dtype=object)
+    assert "account_age_days" in find_missing_or_invalid(df)
+
+
+def test_find_missing_or_invalid_allows_realistic_large_values():
+    # A very large but entirely plausible merchant (huge daily volume,
+    # long-running account) must not get caught by the new upper bound.
+    row = dict(VALID_ROW, account_age_days=10000, daily_txn_volume=5_000_000.0, avg_ticket_size=250_000.0)
+    df = pd.DataFrame([row])
+    assert find_missing_or_invalid(df) == []

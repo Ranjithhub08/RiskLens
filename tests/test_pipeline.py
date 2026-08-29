@@ -107,3 +107,42 @@ def test_decision_always_one_of_the_bounded_set(model, explainer, temp_conn):
     for record in [GOOD_RECORD, LOW_RISK_RECORD, INCOMPLETE_RECORD]:
         result = score_record(record, model, explainer, temp_conn)
         assert result["decision"] in valid_decisions
+
+
+def test_absurdly_large_but_finite_field_fails_safe_instead_of_crashing_xgboost(model, explainer, temp_conn):
+    # A finite, non-negative float like 1e40 passes a plain "is it a valid
+    # non-negative number" check, but XGBoost's predict_proba represents
+    # features as float32 internally (max ~3.4e38) and raises an uncaught
+    # XGBoostError on anything past that -- which used to skip log_event
+    # entirely and silently drop the audit trail for the attempt.
+    record = dict(GOOD_RECORD, account_age_days=1e40)
+    result = score_record(record, model, explainer, temp_conn)
+    assert result["decision"] == "needs_manual_review"
+    assert result["risk_score"] is None
+    events = get_all_events(temp_conn)
+    assert len(events) == 1
+
+
+def test_absurdly_large_integer_field_fails_safe_instead_of_crashing_pandas(model, explainer, temp_conn):
+    # A Python int with hundreds of digits overflows a C double. Without
+    # dtype=object on the DataFrame construction, this raised OverflowError
+    # inside pandas itself, before find_missing_or_invalid ever ran.
+    record = dict(GOOD_RECORD, chargebacks_30d=int("9" * 400))
+    result = score_record(record, model, explainer, temp_conn)
+    assert result["decision"] == "needs_manual_review"
+    assert result["risk_score"] is None
+    events = get_all_events(temp_conn)
+    assert len(events) == 1
+
+
+def test_list_valued_field_fails_safe_instead_of_crashing_on_ambiguous_truth_value(model, explainer, temp_conn):
+    # A hallucinated/malformed caller (e.g. an LLM tool call) could hand a
+    # list where a scalar is expected. pd.isna() on a list/array returns an
+    # array, and evaluating that array's truthiness raises "ValueError: The
+    # truth value of an array... is ambiguous" instead of failing safe.
+    record = dict(GOOD_RECORD, account_age_days=[1, 2, 3])
+    result = score_record(record, model, explainer, temp_conn)
+    assert result["decision"] == "needs_manual_review"
+    assert result["risk_score"] is None
+    events = get_all_events(temp_conn)
+    assert len(events) == 1

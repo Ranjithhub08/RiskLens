@@ -37,7 +37,13 @@ def score_record(record: dict, model, explainer: RiskExplainer, conn) -> dict:
     Returns a dict describing the full outcome, and writes one audit event
     regardless of which branch (scored vs. missing-data fail-safe) is hit.
     """
-    df = pd.DataFrame([record])
+    # dtype=object: pandas' default type-inference on a plain dict can raise
+    # OverflowError itself (e.g. a Python int with 300+ digits) before
+    # find_missing_or_invalid ever gets a chance to reject it safely.
+    # dtype=object keeps every value exactly as given, so validation is
+    # what decides whether it's acceptable, not pandas' internal numeric
+    # coercion.
+    df = pd.DataFrame([record], dtype=object)
     missing = find_missing_or_invalid(df)
 
     risk_score = None
@@ -45,22 +51,39 @@ def score_record(record: dict, model, explainer: RiskExplainer, conn) -> dict:
     top_factors = None
 
     if not missing:
-        X = transform_features(df)
-        if X.isna().any(axis=None):
-            # Belt-and-suspenders: find_missing_or_invalid should have already
-            # caught anything that would produce a NaN feature, but if a value
-            # was present, non-empty, and still produced NaN after transform
-            # (e.g. a value type we didn't anticipate), fail safe rather than
-            # score on it.
-            missing = [
-                col.replace("category_", "business_category (unrecognized value): ")
-                for col in X.columns[X.isna().any()].tolist()
-            ]
-        else:
-            risk_score = float(model.predict_proba(X)[:, 1][0])
-            explained = explainer.explain_row(X)
-            explanation = explained["explanation"]
-            top_factors = explained["top_factors"]
+        try:
+            X = transform_features(df)
+            if X.isna().any(axis=None):
+                # Belt-and-suspenders: find_missing_or_invalid should have
+                # already caught anything that would produce a NaN feature,
+                # but if a value was present, non-empty, and still produced
+                # NaN after transform (e.g. a value type we didn't
+                # anticipate), fail safe rather than score on it.
+                missing = [
+                    col.replace("category_", "business_category (unrecognized value): ")
+                    for col in X.columns[X.isna().any()].tolist()
+                ]
+            else:
+                risk_score = float(model.predict_proba(X)[:, 1][0])
+                explained = explainer.explain_row(X)
+                explanation = explained["explanation"]
+                top_factors = explained["top_factors"]
+        except Exception:
+            # Belt-and-suspenders, one layer further out: find_missing_or_invalid
+            # rejects every kind of bad value we've thought to check for, but a
+            # scoring pipeline that trusts its own validation to be exhaustive is
+            # exactly how this class of bug keeps recurring (see git history --
+            # this project has fixed several "a value we didn't anticipate slips
+            # through validation and crashes the model" bugs already). Any
+            # failure past this point -- a model/SHAP internal error on a
+            # technically-valid-looking but pathological input, for instance --
+            # must still fail safe to manual review rather than propagate and
+            # skip log_event entirely, which would silently drop the audit
+            # trail for this scoring attempt.
+            risk_score = None
+            explanation = None
+            top_factors = None
+            missing = missing or ["unscoreable_input"]
 
     gating_result = decide_for_record(missing, risk_score)
 

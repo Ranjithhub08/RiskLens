@@ -667,6 +667,39 @@ def page_overview():
         )
 
 
+def resolve_selected_case(prior_event_ids: list, selected_rows: list, filtered: list) -> dict:
+    """
+    Resolve the case table's st.dataframe selection into the actual case
+    view it refers to, or None if there's no valid selection.
+
+    st.dataframe's selection is a POSITIONAL row index tied to the widget's
+    key, persisted by Streamlit across reruns -- it is not re-validated
+    against `filtered` on every rerun, it's simply whatever position the
+    user last clicked. But `filtered` is recomputed from scratch every
+    rerun from get_all_events() and can change shape/order any time a case
+    is scored anywhere in the app (this tab, Batch Scoring, or Live Agent
+    -- even from another browser tab), or the moment a filter/search
+    narrows it. Indexing `filtered[selected_rows[0]]` directly on a stale
+    index used to either raise IndexError (selecting row 9, then filtering
+    down to 3 rows -- trivially reachable via this page's own "New
+    investigation" flow, which auto-narrows the search box to the new
+    case) or, worse, silently resolve to a DIFFERENT case if `filtered`'s
+    order shifted without its length changing -- showing one merchant's
+    data under another's case ID with no indication anything was wrong.
+
+    `prior_event_ids` is the event_id ordering that was actually on screen
+    when the click happened (the caller stores this from the previous
+    render); resolving the position against that -- then looking the case
+    up by its stable event_id in the CURRENT `filtered` -- fixes both: a
+    case that's been filtered out or no longer exists simply clears the
+    selection instead of crashing or guessing.
+    """
+    if not selected_rows or selected_rows[0] >= len(prior_event_ids):
+        return None
+    selected_event_id = prior_event_ids[selected_rows[0]]
+    return next((v for v in filtered if v["event_id"] == selected_event_id), None)
+
+
 # =============================================================================
 # PAGE: Investigations
 # =============================================================================
@@ -790,12 +823,17 @@ def page_investigations():
             on_select="rerun", selection_mode="single-row", key="cases_table",
         )
 
+        prior_ids = st.session_state.get("_cases_table_event_ids", [])
         selected_rows = event.selection.rows if event and event.selection else []
-        if selected_rows:
-            selected_view = filtered[selected_rows[0]]
+        selected_view = resolve_selected_case(prior_ids, selected_rows, filtered)
+        st.session_state["_cases_table_event_ids"] = [v["event_id"] for v in filtered]
+
+        if selected_view:
             st.divider()
             st.markdown(f"#### Case #{case_id_from_event(selected_view['event_id'])}")
             render_case_detail(selected_view)
+        elif selected_rows:
+            st.caption("That case is no longer in the current view (it may have been filtered out) -- select a row above to open a case.")
         else:
             st.caption("Select a row above to open the full case detail.")
 
@@ -813,6 +851,27 @@ def _batch_template_csv() -> str:
         "total_txns_30d": 300, "chargebacks_30d": 1, "refunds_30d": 4, "avg_ticket_size": 40,
     }
     return pd.DataFrame([example])[BATCH_REQUIRED_COLUMNS].to_csv(index=False)
+
+
+def compute_batch_identity(batch_df: pd.DataFrame) -> int:
+    """
+    A lightweight fingerprint of a loaded batch's actual contents, used to
+    tell whether a previously-stored batch report (st.session_state
+    key "_batch_results") still corresponds to what's currently loaded.
+
+    Before this existed, "_batch_results" was written only when "Score all"
+    was clicked and then read back and rendered unconditionally on every
+    rerun -- uploading a different CSV, or changing the sample-size input,
+    without re-clicking "Score all" left the previous batch's KPIs, table,
+    and CSV download on screen looking like they belonged to the newly
+    loaded (but never actually scored) batch.
+
+    A simple len()/columns check isn't enough: two different batches can
+    easily share the same row count and schema (e.g. two 25-row samples, or
+    the same CSV re-uploaded with one row edited), so this hashes the
+    actual row contents via pandas' own row-hashing instead.
+    """
+    return int(pd.util.hash_pandas_object(batch_df, index=False).sum())
 
 
 def page_batch_scoring():
@@ -879,6 +938,14 @@ def page_batch_scoring():
         html_block(empty_state_html("No batch loaded yet", "Upload a CSV or pick a sample size above, then run the batch below."))
         return
 
+    # Identifies which loaded batch produced the currently-stored report, so
+    # loading a different CSV/sample size without re-clicking "Score all"
+    # doesn't leave the previous batch's report on screen looking like it
+    # belongs to what's now loaded. pandas' own row-hashing (not e.g. a
+    # simple len()/columns check) is used because two DIFFERENT batches can
+    # easily share the same shape.
+    batch_identity = compute_batch_identity(batch_df)
+
     st.caption(f"{len(batch_df)} merchant(s) ready to score.")
     if st.button(f"Score all {len(batch_df)} merchants", type="primary"):
         progress = st.progress(0.0, text="Scoring...")
@@ -903,10 +970,17 @@ def page_batch_scoring():
             progress.progress((i + 1) / len(records), text=f"Scored {i + 1}/{len(records)}")
         progress.empty()
         st.session_state["_batch_results"] = pd.DataFrame(results)
+        st.session_state["_batch_results_identity"] = batch_identity
         st.success(f"Scored {len(results)} merchants -- every one was also logged to the audit trail.")
 
     results_df = st.session_state.get("_batch_results")
-    if results_df is not None and not results_df.empty:
+    # Only show the stored report if it was produced from the batch that's
+    # CURRENTLY loaded -- uploading a different CSV (or changing the sample
+    # size) without clicking "Score all" again used to leave the previous
+    # batch's report, table, and CSV download on screen with nothing
+    # indicating it no longer matches what's loaded above.
+    results_match_current_batch = st.session_state.get("_batch_results_identity") == batch_identity
+    if results_df is not None and not results_df.empty and results_match_current_batch:
         st.divider()
         st.markdown("#### Batch report")
 
@@ -1030,7 +1104,14 @@ def page_live_agent():
     error_message = st.session_state.get("_last_agent_error")
 
     if error_message:
-        html_block(empty_state_html("Razorpay API connection failed", f"The test order could not be created or the investigation failed to complete.<br><code>{error_message}</code>"))
+        # error_message comes from a Razorpay API exception's str(), which
+        # can echo back the reviewer-typed Merchant ID verbatim (Razorpay
+        # includes invalid request parameters in its error text) -- this is
+        # just as attacker-reachable as any other user-entered field
+        # elsewhere in this file, so it must be escaped before going into
+        # unsafe_allow_html HTML the same way those fields are.
+        safe_error_message = html.escape(str(error_message))
+        html_block(empty_state_html("Razorpay API connection failed", f"The test order could not be created or the investigation failed to complete.<br><code>{safe_error_message}</code>"))
 
     if result:
         html_block(workflow_html(AGENT_STEPS, 6))

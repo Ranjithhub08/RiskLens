@@ -72,12 +72,33 @@ def load_and_split():
     return splits
 
 
+DEFAULT_THRESHOLD = 0.5
+
+
 def best_threshold_for_f1(y_true, y_prob):
-    """Pick the probability threshold that maximizes F1 on the given (validation) set."""
+    """Pick the probability threshold that maximizes F1 on the given (validation) set.
+
+    When the validation split has no positive examples at all (or, more
+    generally, when every candidate threshold ties at F1=0), the F1 curve
+    gives no real signal about where to draw the line -- every threshold is
+    "equally bad" according to F1. np.nanargmax on an all-zero/all-tied
+    array silently picks index 0, i.e. the LOWEST probability the model
+    happened to output on this split, which then gets used as the decision
+    threshold and would classify almost everything on the test set as
+    risky. That's not a real threshold choice, it's an artifact of a
+    degenerate validation split, so fall back to a sane default instead.
+    """
+    if len(y_true) == 0:
+        return DEFAULT_THRESHOLD
     precisions, recalls, thresholds = precision_recall_curve(y_true, y_prob)
+    if len(thresholds) == 0:
+        return DEFAULT_THRESHOLD
     f1s = 2 * precisions * recalls / (precisions + recalls + 1e-9)
-    best_idx = np.nanargmax(f1s[:-1]) if len(thresholds) > 0 else 0
-    return float(thresholds[best_idx]) if len(thresholds) > 0 else 0.5
+    f1s = f1s[:-1]
+    if not np.any(f1s > 0):
+        return DEFAULT_THRESHOLD
+    best_idx = np.nanargmax(f1s)
+    return float(thresholds[best_idx])
 
 
 def evaluate(name, y_true, y_prob, threshold):
@@ -95,9 +116,30 @@ def evaluate(name, y_true, y_prob, threshold):
     return metrics
 
 
+# Same path model/feedback.py's promote_candidate writes as
+# TEST_SNAPSHOT_PATH (duplicated as a literal, not imported, to avoid a
+# circular import -- model/feedback.py already imports from this module). A
+# fresh `python3 model/train.py` run is a normal, documented workflow that
+# regenerates xgb_model.joblib directly, but it does not touch this
+# snapshot -- so without deleting it here, a stale snapshot from a
+# PREVIOUS feedback-augmented promotion is left on disk, no longer
+# matching the model that's actually deployed now. The dashboard's
+# Threshold Explorer (_test_set_predictions) prefers this snapshot
+# whenever it exists, so it would keep showing predictions from the old
+# model/test-split pairing instead of the model that was just trained.
+TEST_SNAPSHOT_PATH = os.path.join(ARTIFACT_DIR, "deployed_test_snapshot.csv")
+
+
+def clear_stale_test_snapshot():
+    """Delete TEST_SNAPSHOT_PATH if present -- see the module-level comment above it."""
+    if os.path.exists(TEST_SNAPSHOT_PATH):
+        os.remove(TEST_SNAPSHOT_PATH)
+
+
 def main():
     os.makedirs(ARTIFACT_DIR, exist_ok=True)
     save_feature_manifest(os.path.join(ARTIFACT_DIR, "feature_manifest.json"))
+    clear_stale_test_snapshot()
 
     splits = load_and_split()
     X_train, y_train = splits["train"]
@@ -162,7 +204,12 @@ def main():
 
     # --- Plots for the dashboard's "Model performance" tab ------------------
     y_pred = (xgb_test_prob >= xgb_threshold).astype(int)
-    cm = confusion_matrix(y_test, y_pred)
+    # labels=[0, 1] guarantees a 2x2 matrix regardless of the class balance
+    # actually present in y_test -- without it, a test split that happens to
+    # contain only one class produces a 1x1 matrix, which
+    # ConfusionMatrixDisplay(..., display_labels=["Not risky", "Risky"])
+    # then crashes on (2 display labels for a 1x1 matrix).
+    cm = confusion_matrix(y_test, y_pred, labels=[0, 1])
     fig, ax = plt.subplots(figsize=(4, 4))
     ConfusionMatrixDisplay(cm, display_labels=["Not risky", "Risky"]).plot(ax=ax, colorbar=False)
     ax.set_title(f"Confusion Matrix (XGBoost, threshold={xgb_threshold:.2f})")

@@ -167,7 +167,12 @@ class RiskAgentTools:
         return _get_merchant_context(merchant_id)
 
     def _row_from_args(self, args: dict) -> pd.DataFrame:
-        return pd.DataFrame([{k: v for k, v in args.items() if k != "merchant_id"}])
+        # dtype=object: pandas' default type-inference on a plain dict can
+        # raise OverflowError itself (e.g. a hallucinated 300+-digit tool
+        # argument) before _validated_row_from_args's find_missing_or_invalid
+        # call ever gets a chance to reject it safely -- see pipeline.py's
+        # score_record, which has the identical guard for the same reason.
+        return pd.DataFrame([{k: v for k, v in args.items() if k != "merchant_id"}], dtype=object)
 
     def _validated_row_from_args(self, args: dict):
         """Returns (X, error_dict) -- exactly one of the two is not None.

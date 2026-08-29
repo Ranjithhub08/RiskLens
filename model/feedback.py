@@ -14,6 +14,7 @@ separate, deliberate, auditable step.
 
 import json
 import os
+import uuid
 
 import joblib
 import numpy as np
@@ -163,6 +164,46 @@ def build_feedback_rows(conn) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def split_original_and_fold_in_feedback(original_df: pd.DataFrame, feedback_df: pd.DataFrame):
+    """
+    Split the ORIGINAL data alone into train/val/test by TRAIN_FRACTION/
+    VAL_FRACTION, then append feedback_df onto the training slice only --
+    never onto a combined-then-resorted frame.
+
+    Feedback rows are stamped with the override's real-world timestamp
+    (build_feedback_rows), which is always later than every date in
+    data/raw/merchant_snapshots.csv (a fixed historical range). Sorting a
+    concatenation of the two by snapshot_date and then slicing by fixed
+    fractions -- what this function replaced -- means every feedback row
+    sorts to the very end of the frame and lands in the test split, never
+    train/val, unless overrides ever numbered in the thousands. The result
+    was silent: the candidate was trained on data numerically identical to
+    the original set (a human's corrections had zero effect on what the
+    model learned), while those same rows quietly contaminated the
+    "held-out" test split used for the before/after comparison. Keeping
+    val/test derived from original_df only, and always folding feedback
+    into train, is what train_candidate_with_feedback's docstring and the
+    dashboard's "trained on the original training set plus N usable
+    overrides" message actually promise.
+
+    Returns (train_df, val_df, test_df).
+    """
+    original_df = original_df.sort_values("snapshot_date").reset_index(drop=True)
+    n = len(original_df)
+    train_end = int(n * TRAIN_FRACTION)
+    val_end = int(n * (TRAIN_FRACTION + VAL_FRACTION))
+    train_df = original_df.iloc[:train_end]
+    val_df = original_df.iloc[train_end:val_end]
+    test_df = original_df.iloc[val_end:]
+
+    if not feedback_df.empty:
+        feedback_df = feedback_df.copy()
+        feedback_df["snapshot_date"] = pd.to_datetime(feedback_df["snapshot_date"], utc=True).dt.tz_localize(None)
+        train_df = pd.concat([train_df, feedback_df], ignore_index=True, sort=False)
+
+    return train_df, val_df, test_df
+
+
 def train_candidate_with_feedback(conn) -> dict:
     """
     Retrains on the ORIGINAL raw training data plus every usable human
@@ -174,20 +215,9 @@ def train_candidate_with_feedback(conn) -> dict:
     original_df = pd.read_csv(RAW_DATA_PATH, parse_dates=["snapshot_date"])
     feedback_df = build_feedback_rows(conn)
     total_overrides = len(get_all_overrides(conn))
+    n = len(original_df)
 
-    if not feedback_df.empty:
-        feedback_df["snapshot_date"] = pd.to_datetime(feedback_df["snapshot_date"], utc=True).dt.tz_localize(None)
-        combined_df = pd.concat([original_df, feedback_df], ignore_index=True, sort=False)
-    else:
-        combined_df = original_df
-    combined_df = combined_df.sort_values("snapshot_date").reset_index(drop=True)
-
-    n = len(combined_df)
-    train_end = int(n * TRAIN_FRACTION)
-    val_end = int(n * (TRAIN_FRACTION + VAL_FRACTION))
-    train_df = combined_df.iloc[:train_end]
-    val_df = combined_df.iloc[train_end:val_end]
-    test_df = combined_df.iloc[val_end:]
+    train_df, val_df, test_df = split_original_and_fold_in_feedback(original_df, feedback_df)
 
     X_train, y_train = transform_features(train_df), train_df["is_risky"].values
     X_val, y_val = transform_features(val_df), val_df["is_risky"].values
@@ -229,7 +259,12 @@ def train_candidate_with_feedback(conn) -> dict:
     # promotion needs to keep the Models page's charts in sync with whatever
     # actually gets deployed is captured from the SAME candidate fit above.
     y_pred = (candidate_prob >= candidate_threshold).astype(int)
-    cm = confusion_matrix(y_test, y_pred)
+    # labels=[0, 1] guarantees a 2x2 matrix regardless of the class balance
+    # in this evaluation's test split (see the identical fix and comment in
+    # model/train.py) -- without it, a 1x1 matrix here would corrupt the
+    # "confusion_matrix" entry written to chart_data.json below, breaking
+    # the Models page's confusion-matrix chart after a promotion.
+    cm = confusion_matrix(y_test, y_pred, labels=[0, 1])
     fpr, tpr, _ = roc_curve(y_test, candidate_prob)
     shap_values = shap.TreeExplainer(candidate).shap_values(X_test)
     mean_abs_shap = np.abs(shap_values).mean(axis=0)
@@ -245,7 +280,12 @@ def train_candidate_with_feedback(conn) -> dict:
     return {
         "total_overrides": total_overrides,
         "feedback_rows_used": len(feedback_df),
-        "combined_rows": n,
+        # n (original_df's row count, used above for the split fractions)
+        # plus feedback rows actually folded into train_df -- this is the
+        # true total the candidate was trained+evaluated on, which is what
+        # the dashboard's "Trained on N rows: the original training set
+        # plus M usable overrides" message reports.
+        "combined_rows": n + len(feedback_df),
         "current_metrics": current_metrics,
         "candidate_metrics": candidate_metrics,
         "candidate_model": candidate,
@@ -356,7 +396,15 @@ def promote_candidate(
     # dict -- the first version of this fix cleaned up only successfully
     # completed temp writes and silently left exactly that kind of orphaned
     # `.tmp_promote` file behind.
-    tmp_paths = {final_path: f"{final_path}.tmp_promote" for final_path in pending}
+    # A unique suffix per call (not a fixed ".tmp_promote" name) so two
+    # concurrent promotions -- e.g. two reviewers clicking "Promote" against
+    # the same Streamlit server process at close to the same time -- write
+    # to different temp files instead of interleaving writes to the same
+    # one, and so one promotion's failure-path cleanup (the `except` below)
+    # can never delete a temp file that actually belongs to the OTHER,
+    # still-in-progress promotion.
+    promote_id = uuid.uuid4().hex
+    tmp_paths = {final_path: f"{final_path}.tmp_promote.{promote_id}" for final_path in pending}
     try:
         # Phase 1: write every artifact to a temp path. If any write fails
         # here, none of the real files have been touched yet.

@@ -2,27 +2,32 @@
 Tests for model/feedback.py -- turning human overrides into training rows,
 and safely promoting a retrained candidate.
 
-train_candidate_with_feedback() itself (the actual retrain) is deliberately
-NOT covered by an automated test here: it trains a real XGBoost model on the
-full 6000-row training set, which would add several real seconds to every
-test run for the sake of re-testing logic model/train.py's own training path
-already exercises. It was verified manually end to end (real overrides in a
-real audit log, producing a candidate with different metrics than the
-deployed model) while building this feature. What IS covered here is the
-part that's actually risky to get wrong: turning an override into the
-correct labeled row (including across both pipelines' different event
-shapes), and making sure promotion never touches a path it wasn't
-explicitly given.
+The actual model.fit() inside train_candidate_with_feedback() is
+deliberately NOT covered by an automated test here: it trains a real
+XGBoost model on the full 6000-row training set, which would add several
+real seconds to every test run for the sake of re-testing logic
+model/train.py's own training path already exercises. It was verified
+manually end to end (real overrides in a real audit log, producing a
+candidate with different metrics than the deployed model) while building
+this feature. What IS covered here is the part that's actually risky to
+get wrong: turning an override into the correct labeled row (including
+across both pipelines' different event shapes), making sure promotion
+never touches a path it wasn't explicitly given, and -- since this is
+exactly where a real bug was found and fixed -- that feedback rows
+actually land in the TRAINING split rather than being silently sorted
+into the held-out test split, which split_original_and_fold_in_feedback
+is pulled out specifically so this can be tested without the slow fit().
 """
 
 import json
 
+import pandas as pd
 import pytest
 
 from audit.audit_log import get_connection, log_event, log_override
 from gating.decision_engine import DECISION_CLEAR
 from model import feedback as feedback_module
-from model.feedback import build_feedback_rows, promote_candidate
+from model.feedback import build_feedback_rows, promote_candidate, split_original_and_fold_in_feedback
 
 RULE_SNAPSHOT = {
     "account_age_days": 900,
@@ -126,6 +131,90 @@ def test_build_feedback_rows_skips_incomplete_agent_case(conn):
     assert rows.empty
 
 
+def _make_original_df(n=100):
+    """A minimal but realistic original_df: n rows spanning a fixed
+    historical date range, half risky/half not, in RAW_REQUIRED_COLUMNS
+    shape plus is_risky/snapshot_date."""
+    dates = pd.date_range("2026-01-01", periods=n, freq="D")
+    return pd.DataFrame(
+        {
+            "snapshot_date": dates,
+            "account_age_days": [900] * n,
+            "kyc_status": ["complete"] * n,
+            "business_category": ["services"] * n,
+            "daily_txn_volume": [9000.0] * n,
+            "avg_30d_txn_volume": [9000.0] * n,
+            "total_txns_30d": [500] * n,
+            "chargebacks_30d": [0] * n,
+            "refunds_30d": [2] * n,
+            "avg_ticket_size": [18.0] * n,
+            "is_risky": [i % 2 for i in range(n)],
+        }
+    )
+
+
+def _make_feedback_df(n=1, timestamp="2026-08-29T00:00:00"):
+    """A feedback row shaped like build_feedback_rows' output -- stamped
+    with a real-world override timestamp, which is always later than
+    original_df's fixed historical date range."""
+    return pd.DataFrame(
+        {
+            "snapshot_date": [timestamp] * n,
+            "account_age_days": [900] * n,
+            "kyc_status": ["complete"] * n,
+            "business_category": ["services"] * n,
+            "daily_txn_volume": [9000.0] * n,
+            "avg_30d_txn_volume": [9000.0] * n,
+            "total_txns_30d": [500] * n,
+            "chargebacks_30d": [0] * n,
+            "refunds_30d": [2] * n,
+            "avg_ticket_size": [18.0] * n,
+            "is_risky": [1] * n,
+            "merchant_id": [f"FEEDBACK_{i}" for i in range(n)],
+        }
+    )
+
+
+def test_feedback_rows_land_in_training_split_not_test_split():
+    """Regression test for the bug this function was written to fix:
+    feedback rows are timestamped with the override's real-world date,
+    always later than original_df's historical range. Sorting a
+    concatenation of the two by snapshot_date and slicing by fixed
+    fractions put every feedback row at the very end -- i.e. in the test
+    split, never train -- so a human's corrections had zero effect on what
+    the candidate model actually learned."""
+    original_df = _make_original_df(n=100)
+    feedback_df = _make_feedback_df(n=1)
+
+    train_df, val_df, test_df = split_original_and_fold_in_feedback(original_df, feedback_df)
+
+    assert "FEEDBACK_0" in train_df["merchant_id"].values
+    assert "FEEDBACK_0" not in val_df.get("merchant_id", pd.Series(dtype=object)).values
+    assert "FEEDBACK_0" not in test_df.get("merchant_id", pd.Series(dtype=object)).values
+
+
+def test_feedback_rows_do_not_shrink_the_held_out_test_split():
+    """val_df/test_df must be derived from original_df alone, so the
+    before/after comparison stays evaluated on a stable, genuinely
+    held-out slice across retrains -- not one that grows/shrinks or gets
+    contaminated by whatever feedback happens to exist yet."""
+    original_df = _make_original_df(n=100)
+
+    train_no_fb, val_no_fb, test_no_fb = split_original_and_fold_in_feedback(original_df, pd.DataFrame())
+    train_with_fb, val_with_fb, test_with_fb = split_original_and_fold_in_feedback(original_df, _make_feedback_df(n=5))
+
+    assert len(val_with_fb) == len(val_no_fb)
+    assert len(test_with_fb) == len(test_no_fb)
+    assert len(train_with_fb) == len(train_no_fb) + 5
+
+
+def test_split_with_no_feedback_returns_original_split_unchanged():
+    original_df = _make_original_df(n=100)
+    train_df, val_df, test_df = split_original_and_fold_in_feedback(original_df, pd.DataFrame())
+    assert len(train_df) + len(val_df) + len(test_df) == 100
+    assert "merchant_id" not in train_df.columns  # original_df has no merchant_id column
+
+
 def test_promote_candidate_never_touches_the_real_deployed_model(tmp_path, monkeypatch):
     """
     promote_candidate overwrites the live model file (and the Models page's
@@ -224,5 +313,52 @@ def test_promote_candidate_leaves_no_partial_state_on_mid_promotion_failure(tmp_
     assert json.loads(fake_metrics_path.read_text())["xgboost"]["f1"] == 0.1
     assert json.loads(fake_chart_data_path.read_text())["confusion_matrix"]["matrix"] == [[1, 0], [0, 1]]
 
-    # No leftover temp files from the failed attempt.
-    assert list(tmp_path.glob("*.tmp_promote")) == []
+    # No leftover temp files from the failed attempt. (Temp files carry a
+    # unique per-call suffix now -- see the concurrent-promotion regression
+    # test below -- so match on the ".tmp_promote." prefix rather than an
+    # exact ".tmp_promote" suffix.)
+    assert list(tmp_path.glob("*.tmp_promote.*")) == []
+
+
+def test_promote_candidate_uses_unique_temp_paths_so_concurrent_promotions_cannot_collide(tmp_path, monkeypatch):
+    # Regression test: temp paths used to be a FIXED name
+    # (f"{final_path}.tmp_promote") with no per-call uniqueness. Two
+    # reviewers promoting at close to the same time -- realistic under
+    # Streamlit's shared-server, thread-per-session model -- could write to
+    # the very same temp file, and one promotion's failure-path cleanup
+    # (`os.remove` on every tmp path) could delete a temp file that still
+    # belonged to the OTHER, still-in-progress promotion. Capturing every
+    # temp path actually written to disk across two "concurrent" calls
+    # (simulated here by hooking joblib.dump) must show two distinct sets.
+    monkeypatch.setattr(feedback_module, "MODEL_PATH", str(tmp_path / "candidate_model.joblib"))
+    monkeypatch.setattr(feedback_module, "THRESHOLD_PATH", str(tmp_path / "candidate_threshold.json"))
+    monkeypatch.setattr(feedback_module, "METRICS_PATH", str(tmp_path / "metrics.json"))
+    monkeypatch.setattr(feedback_module, "CHART_DATA_PATH", str(tmp_path / "chart_data.json"))
+    monkeypatch.setattr(feedback_module, "ARTIFACT_DIR", str(tmp_path))
+
+    seen_model_tmp_paths = []
+    real_joblib_dump = feedback_module.joblib.dump
+
+    def recording_joblib_dump(obj, path, *args, **kwargs):
+        seen_model_tmp_paths.append(path)
+        return real_joblib_dump(obj, path, *args, **kwargs)
+
+    monkeypatch.setattr(feedback_module.joblib, "dump", recording_joblib_dump)
+
+    candidate_metrics = {"threshold": 0.61, "precision": 0.5, "recall": 0.5, "f1": 0.5, "roc_auc": 0.7}
+    candidate_artifacts = {
+        "test_rows": 100,
+        "test_positive_rate": 0.1,
+        "confusion_matrix": [[80, 10], [5, 5]],
+        "roc_curve": {"fpr": [0.0, 1.0], "tpr": [0.0, 1.0], "auc": 0.7},
+        "shap_global_importance": [{"feature": "account_age_days", "mean_abs_shap": 0.2}],
+    }
+
+    promote_candidate(DummyModel(), 0.61, candidate_metrics, candidate_artifacts)
+    promote_candidate(DummyModel(), 0.61, candidate_metrics, candidate_artifacts)
+
+    assert len(seen_model_tmp_paths) == 2
+    assert seen_model_tmp_paths[0] != seen_model_tmp_paths[1]
+    # Neither call's temp path is left behind -- both promotions succeeded
+    # and swapped their (distinct) temp files into place.
+    assert list(tmp_path.glob("*.tmp_promote.*")) == []
