@@ -323,7 +323,7 @@ def render_case_detail(view: dict):
                 <div class="rl-panel-label" style="margin-bottom:7px;">Final decision</div>
                 {decision_badge_html(view["decision"])}
             </div>
-            {authority_strip_html(view["decision_reason"] or "")}
+            {authority_strip_html(view["decision_reason"] or "", view.get("gate_version"))}
         </div>
         """
     )
@@ -700,6 +700,32 @@ def resolve_selected_case(prior_event_ids: list, selected_rows: list, filtered: 
     return next((v for v in filtered if v["event_id"] == selected_event_id), None)
 
 
+MANUAL_ENTRY_SENTINEL = "manual-entry"
+
+
+def resolve_manual_entry_merchant_id(defaults_merchant_id: str, generate_suffix=lambda: secrets.token_hex(4)) -> str:
+    """
+    Every manual-entry investigation used to share the exact literal
+    merchant_id "manual-entry" (the sentinel the New Investigation form's
+    defaults dict uses whenever it did NOT come from a real sample row --
+    either the "load a snapshot" checkbox is unchecked, or the sample
+    dataset happens to be empty). Two different manual investigations, with
+    completely different field values, were both logged under that
+    identical id -- so Overview's "Active cases"/"High-risk merchants" KPIs
+    (which dedupe by merchant_id via a set()) undercounted distinct
+    investigations, and the Investigations case table showed two unrelated
+    snapshots both labeled merchant "manual-entry" with no way to tell them
+    apart except Case ID.
+
+    A short random suffix per investigation keeps the identity distinct
+    while still being recognizable as manual entry (unlike a real dataset
+    merchant_id, which is passed through unchanged).
+    """
+    if defaults_merchant_id != MANUAL_ENTRY_SENTINEL:
+        return defaults_merchant_id
+    return f"{MANUAL_ENTRY_SENTINEL}-{generate_suffix()}"
+
+
 # =============================================================================
 # PAGE: Investigations
 # =============================================================================
@@ -722,7 +748,7 @@ def page_investigations():
             defaults = sample_df.loc[idx].to_dict()
         else:
             defaults = {
-                "merchant_id": "manual-entry", "account_age_days": 365, "kyc_status": "complete",
+                "merchant_id": MANUAL_ENTRY_SENTINEL, "account_age_days": 365, "kyc_status": "complete",
                 "business_category": "services", "daily_txn_volume": 10000.0, "avg_30d_txn_volume": 10000.0,
                 "total_txns_30d": 200, "chargebacks_30d": 1, "refunds_30d": 5, "avg_ticket_size": 50.0,
             }
@@ -743,7 +769,8 @@ def page_investigations():
 
         if st.button("Run investigation", type="primary"):
             record = {
-                "merchant_id": defaults.get("merchant_id", "manual-entry"), "account_age_days": account_age_days,
+                "merchant_id": resolve_manual_entry_merchant_id(defaults.get("merchant_id", MANUAL_ENTRY_SENTINEL)),
+                "account_age_days": account_age_days,
                 "kyc_status": kyc_status, "business_category": business_category, "daily_txn_volume": daily_txn_volume,
                 "avg_30d_txn_volume": avg_30d_txn_volume, "total_txns_30d": total_txns_30d,
                 "chargebacks_30d": chargebacks_30d, "refunds_30d": refunds_30d, "avg_ticket_size": avg_ticket_size,
@@ -1393,7 +1420,12 @@ def render_retrain_from_feedback_section():
     st.caption(
         f"Trained on {result['combined_rows']} rows: the original training set plus "
         f"{result['feedback_rows_used']} usable override(s)"
-        + (f" ({skipped} skipped -- incomplete feature data, or superseded by a later override on the same case)." if skipped else ".")
+        + (
+            f" ({skipped} skipped -- incomplete feature data, superseded by a later override on the same "
+            "case, or overridden to \"needs manual review\" (uncertainty, not a confirmed label))."
+            if skipped
+            else "."
+        )
     )
     html_block(
         f"""

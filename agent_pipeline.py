@@ -13,7 +13,7 @@ dashboard's "Live agent" tab.
 from agent.risk_agent import run_risk_agent
 from agent.tools import RiskAgentTools
 from audit.audit_log import log_event
-from gating.decision_engine import DECISION_MANUAL_REVIEW
+from gating.decision_engine import DECISION_MANUAL_REVIEW, GATE_VERSION
 from integrations.razorpay_client import create_test_order, order_to_transaction_fields
 
 
@@ -81,6 +81,8 @@ def run_agentic_scoring(merchant_id: str, amount_rupees: float, model, explainer
         source="agent_pipeline",
         agent_proposal=agent_result["agent_proposal"],
         agent_trace=agent_result["trace"],
+        gate_version=GATE_VERSION,
+        thresholds_used=agent_result.get("thresholds_used"),
     )
 
     return {

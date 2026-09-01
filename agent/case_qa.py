@@ -71,4 +71,11 @@ def answer_case_question(
         max_tokens=400,
     )
     content = response.choices[0].message.content
-    return content.strip() if content else "I wasn't able to generate an answer for that -- try rephrasing the question."
+    # Check the STRIPPED value, not the raw one: a whitespace-only response
+    # ("   ", "\n") is truthy in Python, so `if content` alone would take
+    # this branch and return "" instead of falling back to the message
+    # below -- leaving a blank chat bubble on screen with no indication
+    # anything went wrong, and permanently baking an empty "assistant" turn
+    # into this case's history for every future question in the session.
+    stripped = (content or "").strip()
+    return stripped if stripped else "I wasn't able to generate an answer for that -- try rephrasing the question."

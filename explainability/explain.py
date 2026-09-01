@@ -43,10 +43,54 @@ FEATURE_PHRASES = {
 }
 
 
-def _phrase_for(feature_name: str, shap_value: float) -> str:
+# Whether a feature's OWN VALUE counts as "elevated"/"new"/"spiked" etc.,
+# independent of any single row's SHAP sign -- see _phrase_for's docstring
+# for why these must be decoupled. Matched to data/raw/generate_data.py's
+# own labeling rule where one exists (volume_change_pct, chargeback_rate,
+# refund_rate, account_age_days, kyc_complete); avg_ticket_size isn't part
+# of that rule (the label doesn't depend on it at all), so its threshold is
+# instead the ~90th percentile actually observed in the real training data
+# (data/raw/merchant_snapshots.csv's avg_ticket_size distribution).
+_FEATURE_IS_ELEVATED = {
+    "account_age_days": lambda v: v < 60,
+    "kyc_complete": lambda v: v < 0.5,
+    "volume_change_pct": lambda v: v > 0.8,
+    "chargeback_rate": lambda v: v > 0.02,
+    "refund_rate": lambda v: v > 0.08,
+    "avg_ticket_size": lambda v: v > 2500,
+}
+
+
+def _phrase_for(feature_name: str, shap_value: float, raw_value: float = None) -> str:
+    """
+    shap_value decides which heading a factor appears under (raising vs.
+    lowering the score) -- that's a correct use of SHAP sign, since it's
+    exactly what "did this factor push the score up or down" means.
+
+    But SHAP sign must NOT be used to decide the WORDING of the phrase
+    itself (whether to say "elevated"/"new"/"spiked" vs. "low"/
+    "established"/"typical") -- a feature's SHAP value reflects its
+    marginal contribution to THIS row's score GIVEN this row's specific
+    combination of every other feature, on a model trained on
+    deliberately noisy synthetic data (see gating/decision_engine.py's own
+    comment that the training data "only weakly separates risky from
+    clean merchants"). That frequently disagrees with whether the raw
+    value is actually high or low -- e.g. a chargeback_rate of 0.4% (near
+    the bottom of the real range) can still carry a positive SHAP value in
+    combination with other features, and the old code would have called
+    that "elevated" -- a factually false, and in the opposite-of-low-risk
+    direction, misleading statement for the reviewer relying on this as
+    the system's core explainability output. So the phrase's factual claim
+    is grounded in the feature's own value via _FEATURE_IS_ELEVATED
+    instead, while shap_value still and only controls bucket placement.
+    """
     direction = "up" if shap_value > 0 else "down"
     if feature_name in FEATURE_PHRASES:
-        return FEATURE_PHRASES[feature_name][direction]
+        if feature_name in _FEATURE_IS_ELEVATED and raw_value is not None and np.isfinite(raw_value):
+            wording = "up" if _FEATURE_IS_ELEVATED[feature_name](raw_value) else "down"
+        else:
+            wording = direction
+        return FEATURE_PHRASES[feature_name][wording]
     if feature_name.startswith("category_"):
         category = feature_name.replace("category_", "")
         if direction == "up":
@@ -88,8 +132,8 @@ class RiskExplainer:
         # say so explicitly -- otherwise a low-risk case whose top factors
         # were all risk-*reducing* would get worded as if it had been
         # flagged, which is backwards and misleading in a demo or an audit.
-        raising = [_phrase_for(name, val) for name, val in top if val > 0]
-        lowering = [_phrase_for(name, val) for name, val in top if val < 0]
+        raising = [_phrase_for(name, val, X_row[name].iloc[0]) for name, val in top if val > 0]
+        lowering = [_phrase_for(name, val, X_row[name].iloc[0]) for name, val in top if val < 0]
 
         if not raising and not lowering:
             explanation = "No single factor stood out; the score reflects a combination of small effects."

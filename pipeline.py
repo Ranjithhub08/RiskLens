@@ -17,7 +17,7 @@ import pandas as pd
 from audit.audit_log import get_connection, log_event
 from explainability.explain import RiskExplainer
 from features.features import find_missing_or_invalid, transform_features
-from gating.decision_engine import decide_for_record
+from gating.decision_engine import GATE_VERSION, decide_for_record
 
 MODEL_PATH = "model/artifacts/xgb_model.joblib"
 THRESHOLD_PATH = "model/artifacts/decision_threshold.json"
@@ -59,10 +59,22 @@ def score_record(record: dict, model, explainer: RiskExplainer, conn) -> dict:
                 # but if a value was present, non-empty, and still produced
                 # NaN after transform (e.g. a value type we didn't
                 # anticipate), fail safe rather than score on it.
-                missing = [
-                    col.replace("category_", "business_category (unrecognized value): ")
-                    for col in X.columns[X.isna().any()].tolist()
-                ]
+                # transform_features sets ALL SIX category_* one-hot
+                # columns to NaN together whenever business_category itself
+                # is NaN (see features.py) -- naively mapping each one
+                # individually used to produce the same
+                # "business_category (unrecognized value)" complaint six
+                # times over (once per one-hot column, each suffixed with
+                # a fixed category NAME like "electronics"/"fashion", not
+                # the merchant's actual invalid value), a confusing,
+                # redundant reason string. Dedupe to one entry per logical
+                # field instead.
+                missing = sorted(
+                    {
+                        "business_category (unrecognized value)" if col.startswith("category_") else col
+                        for col in X.columns[X.isna().any()].tolist()
+                    }
+                )
             else:
                 risk_score = float(model.predict_proba(X)[:, 1][0])
                 explained = explainer.explain_row(X)
@@ -96,6 +108,8 @@ def score_record(record: dict, model, explainer: RiskExplainer, conn) -> dict:
         explanation=explanation,
         decision=gating_result.decision,
         decision_reason=gating_result.reason,
+        gate_version=GATE_VERSION,
+        thresholds_used=gating_result.thresholds_used,
     )
 
     return {

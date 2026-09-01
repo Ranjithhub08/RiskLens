@@ -453,11 +453,19 @@ def risk_scale_html(score) -> str:
     """
 
 
-def authority_strip_html(gate_reason: str) -> str:
+def authority_strip_html(gate_reason: str, gate_version: str = None) -> str:
+    # gate_version: the gate identifier actually persisted with THIS case
+    # at scoring time (audit_events.gate_version), so a past case scored
+    # under a different rule set/thresholds still shows what actually
+    # produced ITS decision rather than whatever the live GATE_VERSION
+    # constant happens to be today. Falls back to the current live
+    # constant for a fresh live result (which is always current by
+    # definition) and for any older row written before this was tracked.
+    display_version = gate_version or GATE_VERSION
     return f"""
     <div class="rl-authority">
         <span>{gate_reason}</span>
-        <span>AI does not control this decision &nbsp;&#183;&nbsp; Final authority: <b>{GATE_VERSION}</b></span>
+        <span>AI does not control this decision &nbsp;&#183;&nbsp; Final authority: <b>{display_version}</b></span>
     </div>
     """
 

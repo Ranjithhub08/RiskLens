@@ -92,6 +92,63 @@ def test_build_feedback_rows_maps_non_clear_override_to_risky(conn):
     assert rows.iloc[0]["is_risky"] == 1
 
 
+def test_build_feedback_rows_excludes_manual_review_overrides_entirely(conn):
+    # Regression test: overriding a case to "needs_manual_review" is a
+    # reviewer asserting UNCERTAINTY ("I can't decide this myself"), not
+    # confirming the merchant is risky -- it used to be treated exactly
+    # like an "escalate"/"flag" override (is_risky=1), silently injecting a
+    # mislabeled row asserting confirmed risk for an explicitly-undetermined
+    # case into every future retrain.
+    event_id = log_event(conn, "M1", RULE_SNAPSHOT, 0.5, None, "explanation", "escalate", "reason")
+    log_override(conn, event_id, "escalate", "needs_manual_review", "Not enough information to decide either way.")
+
+    rows = build_feedback_rows(conn)
+    assert rows.empty
+
+
+def test_build_feedback_rows_survives_an_overflow_sized_stored_field(conn):
+    # Regression test: pd.DataFrame([features]) (without dtype=object) can
+    # raise OverflowError itself during pandas' default type-inference on a
+    # huge Python int stored in a past event's input_snapshot -- reachable
+    # because a reviewer can override ANY case, including one that was
+    # originally routed to needs_manual_review precisely because it
+    # contained such a value in the first place (see pipeline.py's
+    # identical dtype=object fix). Without it, this crashes
+    # build_feedback_rows entirely -- not just skipping this one bad
+    # override -- since it happens while iterating every override.
+    snapshot = dict(RULE_SNAPSHOT, chargebacks_30d=int("9" * 400))
+    event_id = log_event(conn, "M1", snapshot, None, None, None, "needs_manual_review", "invalid input")
+    log_override(conn, event_id, "needs_manual_review", DECISION_CLEAR, "Reviewed manually, looks fine.")
+
+    rows = build_feedback_rows(conn)  # must not raise
+    assert rows.empty  # the huge value is still invalid, so it's correctly skipped -- just without crashing
+
+
+def test_build_feedback_rows_does_not_silently_truncate_at_the_default_page_size(conn, monkeypatch):
+    # Regression test: get_all_overrides' own default limit (1000) exists
+    # for a bounded-page caller like a dashboard KPI -- the exact same
+    # class of bug already found and fixed once there (commit 4d07816).
+    # build_feedback_rows must ask for every override, not accept that
+    # same default, or retraining (and the "N usable overrides" count)
+    # would silently exclude anything older once volume passes 1000.
+    seen_limits = []
+    real_get_all_overrides = feedback_module.get_all_overrides
+
+    def spy(conn, limit=1000):
+        seen_limits.append(limit)
+        return real_get_all_overrides(conn, limit=limit)
+
+    monkeypatch.setattr(feedback_module, "get_all_overrides", spy)
+
+    event_id = log_event(conn, "M1", RULE_SNAPSHOT, 0.5, None, "explanation", "escalate", "reason")
+    log_override(conn, event_id, "escalate", DECISION_CLEAR, "Confirmed legitimate.")
+
+    build_feedback_rows(conn)
+
+    assert seen_limits, "get_all_overrides was never called"
+    assert all(limit > 1000 for limit in seen_limits)
+
+
 def test_build_feedback_rows_extracts_features_from_agent_pipeline_trace(conn):
     """
     agent_pipeline events don't store the full merchant profile in

@@ -146,3 +146,26 @@ def test_list_valued_field_fails_safe_instead_of_crashing_on_ambiguous_truth_val
     assert result["risk_score"] is None
     events = get_all_events(temp_conn)
     assert len(events) == 1
+
+
+def test_belt_and_suspenders_nan_category_reports_one_reason_not_six(model, explainer, temp_conn, monkeypatch):
+    # Regression test: transform_features sets ALL SIX category_* one-hot
+    # columns to NaN together whenever business_category is NaN, so the
+    # belt-and-suspenders branch in score_record (reached only if a value
+    # slips past find_missing_or_invalid but still produces a NaN feature)
+    # used to report "business_category (unrecognized value): <category>"
+    # once per one-hot column -- six duplicate, confusing entries -- instead
+    # of naming the field once. find_missing_or_invalid already rejects any
+    # NaN/unrecognized business_category before this branch is reachable in
+    # practice, so it's forced here by monkeypatching validation to let one
+    # through.
+    import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "find_missing_or_invalid", lambda df: [])
+    record = dict(GOOD_RECORD, business_category=None)
+    result = score_record(record, model, explainer, temp_conn)
+
+    assert result["decision"] == "needs_manual_review"
+    assert result["risk_score"] is None
+    category_reasons = [f for f in result["missing_fields"] if "business_category" in f]
+    assert category_reasons == ["business_category (unrecognized value)"]

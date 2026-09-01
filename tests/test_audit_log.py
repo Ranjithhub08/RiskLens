@@ -1,9 +1,13 @@
+import json
 import os
+import sqlite3
 import tempfile
+import threading
 
 import pytest
 
 from audit.audit_log import (
+    _MIGRATION_COLUMNS,
     get_all_events,
     get_all_overrides,
     get_connection,
@@ -160,3 +164,127 @@ def test_get_all_overrides_returns_every_override(temp_conn):
     all_overrides = get_all_overrides(temp_conn)
     assert len(all_overrides) == 2
     assert {o["event_id"] for o in all_overrides} == {e1, e2}
+
+
+def test_log_event_persists_gate_version_and_thresholds_used(temp_conn):
+    # Regression test: gating.decision_engine.GATE_VERSION/thresholds_used
+    # used to be computed on every decision but never written anywhere --
+    # the audit trail's own docstring promise ("any past decision can be
+    # replayed exactly") was false, and it had already gone stale once
+    # (thresholds changed in commit bf2d34c with nothing logged either
+    # way). A row must carry the exact gate identity that produced it.
+    event_id = log_event(
+        temp_conn, "M1", {"a": 1}, 0.55, None, "e", "escalate", "r",
+        gate_version="DETERMINISTIC-GATE-01",
+        thresholds_used={"escalate_threshold": 0.50, "flag_threshold": 0.62},
+    )
+    events = get_all_events(temp_conn)
+    event = next(e for e in events if e["event_id"] == event_id)
+    assert event["gate_version"] == "DETERMINISTIC-GATE-01"
+    assert json.loads(event["thresholds_used"]) == {"escalate_threshold": 0.50, "flag_threshold": 0.62}
+
+
+def test_log_event_without_gate_version_leaves_it_null_not_a_crash(temp_conn):
+    # Existing callers that haven't been updated to pass gate_version/
+    # thresholds_used must still work unchanged.
+    event_id = log_event(temp_conn, "M1", {"a": 1}, 0.1, None, "e", "clear", "r")
+    events = get_all_events(temp_conn)
+    event = next(e for e in events if e["event_id"] == event_id)
+    assert event["gate_version"] is None
+    assert event["thresholds_used"] is None
+
+
+def test_concurrent_writes_from_multiple_threads_on_one_shared_connection_do_not_corrupt_or_lose_rows(temp_conn):
+    # Regression test: the dashboard caches ONE sqlite3.Connection
+    # (check_same_thread=False) shared across every Streamlit session's
+    # worker thread. Before _WRITE_LOCK existed, two threads' execute()/
+    # commit() calls could interleave on that same connection object --
+    # exactly the mechanism commit a423fa2 already proved causes
+    # "cannot start a transaction within a transaction" errors and rows
+    # that silently never land in the table, for api/main.py's now-fixed
+    # per-request-connection pattern. That fix never touched this
+    # still-shared dashboard connection. Hammer the same connection from
+    # many threads at once and confirm every single row survives.
+    n_threads = 20
+    writes_per_thread = 5
+    errors = []
+
+    def write_many(thread_idx):
+        try:
+            for i in range(writes_per_thread):
+                log_event(
+                    temp_conn, f"M{thread_idx}", {"i": i}, 0.5, None, "e", "clear",
+                    f"thread {thread_idx} write {i}",
+                )
+        except Exception as e:  # pragma: no cover - failure path under test
+            errors.append(e)
+
+    threads = [threading.Thread(target=write_many, args=(i,)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    events = get_all_events(temp_conn, limit=n_threads * writes_per_thread + 10)
+    assert len(events) == n_threads * writes_per_thread
+
+
+def _flaky_connection_factory(operational_error_message):
+    """A sqlite3.Connection subclass whose first ALTER TABLE ADD COLUMN
+    raises the given OperationalError message once, then behaves normally --
+    simulating a concurrent connection having just won a migration race."""
+
+    class FlakyConnection(sqlite3.Connection):
+        _raised = False
+
+        def execute(self, sql, *args, **kwargs):
+            if "ALTER TABLE" in sql and "ADD COLUMN" in sql and not FlakyConnection._raised:
+                FlakyConnection._raised = True
+                raise sqlite3.OperationalError(operational_error_message)
+            return super().execute(sql, *args, **kwargs)
+
+    return FlakyConnection
+
+
+def test_get_connection_tolerates_a_concurrent_duplicate_column_migration_race(monkeypatch, tmp_path):
+    # Regression test: get_connection() reads existing_cols, then runs
+    # ALTER TABLE for any column it thinks is missing. Two connections
+    # opened against the same on-disk database at nearly the same moment
+    # can both read existing_cols BEFORE either has run its ALTER TABLE --
+    # so even though THIS connection correctly saw the column as missing
+    # (a genuine TOCTOU race, not a bug in its own bookkeeping), a
+    # concurrent connection can add it first, and this connection's own
+    # ALTER TABLE then raises "duplicate column name" and used to crash
+    # get_connection() (and whatever request/page load triggered it) for
+    # no real reason -- the column ends up present either way.
+    db_path = str(tmp_path / "race.db")
+    real_connect = sqlite3.connect
+    factory = _flaky_connection_factory(f"duplicate column name: {_MIGRATION_COLUMNS[0][0]}")
+    monkeypatch.setattr(
+        "audit.audit_log.sqlite3.connect",
+        lambda database, **kwargs: real_connect(database, factory=factory, **kwargs),
+    )
+
+    conn = get_connection(db_path)  # must not raise
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(audit_events)")}
+    # The second migration column, unaffected by the simulated race,
+    # was still added normally by this same call.
+    assert _MIGRATION_COLUMNS[1][0] in existing_cols
+    conn.close()
+
+
+def test_get_connection_still_raises_a_genuinely_different_operational_error(monkeypatch, tmp_path):
+    # Only "duplicate column name" is a known-harmless race; any other
+    # ALTER TABLE failure is a real problem and must still surface rather
+    # than being silently swallowed alongside it.
+    db_path = str(tmp_path / "real_error.db")
+    real_connect = sqlite3.connect
+    factory = _flaky_connection_factory("disk I/O error")
+    monkeypatch.setattr(
+        "audit.audit_log.sqlite3.connect",
+        lambda database, **kwargs: real_connect(database, factory=factory, **kwargs),
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        get_connection(db_path)

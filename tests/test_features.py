@@ -211,6 +211,40 @@ def test_find_missing_or_invalid_flags_list_valued_field_without_crashing():
     assert "account_age_days" in find_missing_or_invalid(df)
 
 
+def test_find_missing_or_invalid_flags_boolean_valued_numeric_field():
+    # Regression test: bool is a subclass of int in Python, so
+    # float(True)/float(False) succeed (1.0/0.0) and are non-negative and
+    # finite -- a hallucinated agent tool call like
+    # {"account_age_days": true} used to sail through every numeric check
+    # as if it were an ordinary 0/1 instead of failing safe like any other
+    # non-numeric value.
+    row = dict(VALID_ROW, account_age_days=True)
+    df = pd.DataFrame([row], dtype=object)
+    assert "account_age_days" in find_missing_or_invalid(df)
+
+    row2 = dict(VALID_ROW, total_txns_30d=False)
+    df2 = pd.DataFrame([row2], dtype=object)
+    assert "total_txns_30d" in find_missing_or_invalid(df2)
+
+
+def test_find_missing_or_invalid_flags_near_zero_avg_volume():
+    # Regression test: avg_30d_txn_volume near 0 is individually a "valid"
+    # non-negative number, but transform_features divides by it to compute
+    # volume_change_pct -- combined with any real daily_txn_volume, this
+    # produces a value in the billions that the model never saw in
+    # training (the real dataset's volume_change_pct never exceeds
+    # roughly +/-0.5), silently scoring nonsense instead of failing safe.
+    row = dict(VALID_ROW, avg_30d_txn_volume=0.0001, daily_txn_volume=5000.0)
+    df = pd.DataFrame([row])
+    assert "avg_30d_txn_volume" in find_missing_or_invalid(df)
+
+
+def test_find_missing_or_invalid_allows_realistic_avg_volume():
+    row = dict(VALID_ROW, avg_30d_txn_volume=186.0, daily_txn_volume=200.0)
+    df = pd.DataFrame([row])
+    assert find_missing_or_invalid(df) == []
+
+
 def test_find_missing_or_invalid_allows_realistic_large_values():
     # A very large but entirely plausible merchant (huge daily volume,
     # long-running account) must not get caught by the new upper bound.

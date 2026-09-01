@@ -70,6 +70,18 @@ def test_empty_model_response_does_not_crash():
     assert "try rephrasing" in answer.lower()
 
 
+def test_whitespace_only_model_response_falls_back_to_the_same_message():
+    # Regression test: a whitespace-only reply ("   ", "\n") is truthy in
+    # Python, so `content.strip() if content else FALLBACK` used to take
+    # the `.strip()` branch and return "" -- a blank chat bubble with no
+    # indication anything failed, instead of the same graceful fallback
+    # already used for a None/empty response.
+    client = FakeGroqClient(reply="   \n")
+    answer = answer_case_question("Anything?", CASE_CONTEXT, groq_client=client)
+
+    assert "try rephrasing" in answer.lower()
+
+
 def test_prompt_injection_in_case_data_cannot_hijack_the_system_prompt():
     """
     A case's decision reason or an override's reason is free text a human

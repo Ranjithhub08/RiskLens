@@ -161,6 +161,69 @@ def test_running_out_of_turns_fails_safe_to_manual_review(tools):
     assert result["gated_decision"] == "needs_manual_review"
 
 
+class FlakyGroqClient:
+    """Like ScriptedGroqClient, but the given `fail_on_call` (1-indexed) call
+    raises instead of returning a scripted response -- simulates a
+    transient LLM-API failure (rate limit, network timeout, ...) partway
+    through the loop."""
+
+    def __init__(self, responses, fail_on_call: int):
+        self._responses = list(responses)
+        self._fail_on_call = fail_on_call
+        self.call_count = 0
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs):
+        self.call_count += 1
+        if self.call_count == self._fail_on_call:
+            raise RuntimeError("simulated transient Groq API failure")
+        response = self._responses[self.call_count - 1]
+        return response
+
+
+def test_mid_loop_api_failure_preserves_already_computed_score_instead_of_losing_it(tools):
+    # Regression test: turn 1 successfully computes a real risk score and
+    # explanation (score_transaction_risk, explain_transaction_risk). Turn
+    # 2's LLM API call then fails (a transient rate limit/timeout/malformed
+    # response -- a real, common failure mode, not a rare edge case). This
+    # used to propagate the raw exception straight out of run_risk_agent,
+    # discarding computed_risk_score/explanation/top_factors/trace entirely
+    # even though they were already legitimately computed -- in contrast to
+    # the "ran out of turns" path (tested above), which deliberately
+    # preserves and gates the same kind of partial progress instead of
+    # throwing it away.
+    scripted_responses = [
+        _response(_tool_message([_tool_call("1", "score_transaction_risk", MERCHANT_ARGS)])),
+        _response(_tool_message([_tool_call("2", "explain_transaction_risk", MERCHANT_ARGS)])),
+    ]
+    flaky = FlakyGroqClient(scripted_responses, fail_on_call=3)
+
+    result = run_risk_agent({"merchant_id": "AGT5", "daily_txn_volume": 9000}, tools, groq_client=flaky)
+
+    # Must not raise, and must preserve what turn 1 already computed rather
+    # than discarding it.
+    assert result["risk_score"] is not None
+    assert result["explanation"] is not None
+    assert len(result["trace"]) == 2
+    assert result["gated_decision"] in {"clear", "escalate", "flag_for_compliance_review", "needs_manual_review"}
+    # The gate's real decision (derived from the real score), not a blind
+    # "needs_manual_review" that throws away the evidence already gathered.
+    assert result["gated_reason"] != "The agent's reasoning could not be completed (a language-model API call failed) -- routed for manual review."
+
+
+def test_api_failure_before_any_score_still_fails_safe_without_crashing(tools):
+    # If the very first call fails (no score ever computed), there's
+    # nothing to gate on -- must still fail safe to manual review, not
+    # crash, and not claim a score exists.
+    flaky = FlakyGroqClient([], fail_on_call=1)
+
+    result = run_risk_agent({"merchant_id": "AGT6", "daily_txn_volume": 9000}, tools, groq_client=flaky)
+
+    assert result["risk_score"] is None
+    assert result["gated_decision"] == "needs_manual_review"
+    assert result["trace"] == []
+
+
 def test_final_answer_via_submit_decision_tool_call(tools):
     """
     Groq's real tool-use models -- unlike our scripted fake client in every other

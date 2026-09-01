@@ -25,7 +25,7 @@ from xgboost import XGBClassifier
 
 from audit.audit_log import get_all_overrides, get_event_by_id
 from features.features import RAW_REQUIRED_COLUMNS, find_missing_or_invalid, transform_features
-from gating.decision_engine import DECISION_CLEAR
+from gating.decision_engine import DECISION_CLEAR, DECISION_MANUAL_REVIEW
 from model.train import (
     RAW_DATA_PATH,
     TRAIN_FRACTION,
@@ -47,6 +47,16 @@ CHART_DATA_PATH = os.path.join(ARTIFACT_DIR, "chart_data.json")
 # that independent re-derivation goes stale the moment feedback rows are
 # involved.
 TEST_SNAPSHOT_PATH = os.path.join(ARTIFACT_DIR, "deployed_test_snapshot.csv")
+
+# get_all_overrides' own default limit (1000) exists for callers that want
+# a bounded page (e.g. a dashboard KPI) -- this module's whole point is to
+# fold EVERY usable override into a retrain, so silently seeing only the
+# most recent 1000 once that many accumulate would be the exact same class
+# of bug already found and fixed once for the dashboard's "Human override
+# rate" KPI (commit 4d07816), just reachable here instead: retraining and
+# the "N usable overrides" count would silently exclude older overrides
+# with no error or warning once override volume passes 1000.
+_ALL_OVERRIDES_LIMIT = 1_000_000
 
 
 def _extract_features_from_event(event: dict) -> dict:
@@ -112,11 +122,15 @@ def build_feedback_rows(conn) -> pd.DataFrame:
     ordering) keeps only the reviewer's current verdict on each case.
 
     Label mapping: a reviewer correcting a case to "clear" is a ground-truth
-    NOT-risky example (is_risky=0); correcting it to anything else (escalate,
-    flag_for_compliance_review, needs_manual_review) is a ground-truth risky
-    example (is_risky=1). This collapses RiskLens's 4-way decision into the
-    model's binary target -- the same simplification the deterministic gate
-    already makes by thresholding a single risk probability.
+    NOT-risky example (is_risky=0); correcting it to "escalate" or
+    "flag_for_compliance_review" is a ground-truth risky example
+    (is_risky=1). This collapses RiskLens's decisions into the model's
+    binary target -- the same simplification the deterministic gate already
+    makes by thresholding a single risk probability. Overriding a case to
+    "needs_manual_review" is excluded entirely (neither label): that
+    override means the reviewer is asserting UNCERTAINTY, not confirming
+    the merchant is risky, so it carries no usable ground-truth signal
+    either way.
 
     Overrides whose original event can't be found, whose feature row is
     incomplete (e.g. an agent case where get_merchant_context was never
@@ -141,7 +155,7 @@ def build_feedback_rows(conn) -> pd.DataFrame:
     guards against, just reachable through this second path instead.
     """
     latest_override_by_event = {}
-    for override in get_all_overrides(conn):
+    for override in get_all_overrides(conn, limit=_ALL_OVERRIDES_LIMIT):
         # most-recent-first ordering means the first override seen here for
         # a given event_id is the reviewer's latest word on that case --
         # setdefault keeps only that one and ignores any older, superseded
@@ -156,7 +170,26 @@ def build_feedback_rows(conn) -> pd.DataFrame:
         features = _extract_features_from_event(event)
         if any(features.get(col) is None for col in RAW_REQUIRED_COLUMNS):
             continue
-        if find_missing_or_invalid(pd.DataFrame([features])):
+        # dtype=object: without it, pandas' default type-inference on this
+        # dict can raise OverflowError itself (e.g. a stored input_snapshot
+        # field that's a Python int with 300+ digits -- reachable because a
+        # reviewer can override ANY case, including one that was originally
+        # routed to needs_manual_review precisely because pipeline.py's own
+        # dtype=object-protected path caught such a value; see pipeline.py's
+        # identical fix and comment). Without this, that crash happens here,
+        # before find_missing_or_invalid ever gets a chance to reject it
+        # safely, and blocks retraining entirely -- not just skipping this
+        # one bad override -- since it's raised while iterating ALL of them.
+        if find_missing_or_invalid(pd.DataFrame([features], dtype=object)):
+            continue
+        # A reviewer overriding a case to "needs manual review" is asserting
+        # UNCERTAINTY ("I can't decide this myself"), not confirming the
+        # merchant is risky -- treating it the same as an "escalate"/"flag"
+        # override (is_risky=1) would inject a mislabeled row asserting
+        # confirmed risk for a case that was explicitly punted as
+        # undetermined. Skipped here the same way an unresolvable/invalid
+        # case already is, rather than guessed at either way.
+        if override["overridden_decision"] == DECISION_MANUAL_REVIEW:
             continue
         features["is_risky"] = 0 if override["overridden_decision"] == DECISION_CLEAR else 1
         features["snapshot_date"] = override["timestamp_utc"]
@@ -214,7 +247,7 @@ def train_candidate_with_feedback(conn) -> dict:
     """
     original_df = pd.read_csv(RAW_DATA_PATH, parse_dates=["snapshot_date"])
     feedback_df = build_feedback_rows(conn)
-    total_overrides = len(get_all_overrides(conn))
+    total_overrides = len(get_all_overrides(conn, limit=_ALL_OVERRIDES_LIMIT))
     n = len(original_df)
 
     train_df, val_df, test_df = split_original_and_fold_in_feedback(original_df, feedback_df)

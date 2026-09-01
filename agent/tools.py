@@ -230,6 +230,21 @@ class RiskAgentTools:
         then most recent. Deliberately excludes this merchant's own past
         events so the agent is comparing against *other* cases, not itself.
         """
+        # `limit` isn't in this tool's schema (only merchant_id is), but
+        # RiskAgentTools.call() below passes through whatever keys the
+        # LLM's tool-call JSON happens to contain regardless of the schema
+        # -- a hallucinated call like {"merchant_id": "m1", "limit": "5"}
+        # (string) or {"limit": 2.5} reaches this method unvalidated and
+        # used to raise an unhandled TypeError from list slicing further
+        # down instead of the structured, fail-safe handling every other
+        # tool in this file gives adversarial arguments. Coerce/clamp here
+        # instead of trusting it.
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 3
+        limit = max(0, limit)
+
         current_category = _get_merchant_context(merchant_id)["business_category"]
         events = get_all_events(self.conn, limit=500)  # already ordered most-recent-first
 
@@ -251,11 +266,17 @@ class RiskAgentTools:
             }
             (same_category if past_category == current_category else other_category).append(entry)
 
-        picked = (same_category + other_category)[:limit]
+        all_candidates = same_category + other_category
+        picked = all_candidates[:limit]
+        # The "no cases exist" note must reflect whether precedent actually
+        # exists at all (all_candidates), not whether any survived the
+        # limit truncation (picked) -- a limit=0 or other small limit used
+        # to make this claim "no past cases exist" even when they do,
+        # giving the agent factually wrong information to reason from.
         return {
             "current_business_category": current_category,
             "similar_cases": picked,
-            "note": None if picked else "No past cases exist yet for any other merchant.",
+            "note": None if all_candidates else "No past cases exist yet for any other merchant.",
         }
 
     def call(self, name: str, arguments: dict):

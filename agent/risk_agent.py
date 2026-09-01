@@ -144,13 +144,34 @@ def run_risk_agent(
 
     for turn in range(MAX_TURNS):
         _emit(on_step, {"type": "thinking", "turn": turn + 1})
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=TOOL_SCHEMAS,
-            tool_choice="auto",
-        )
-        message = response.choices[0].message
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=TOOL_SCHEMAS,
+                tool_choice="auto",
+            )
+            message = response.choices[0].message
+        except Exception:
+            # A transient LLM-API failure (rate limit, network timeout, an
+            # unexpected/empty response shape) on turn 2+ used to propagate
+            # straight out of this function, DISCARDING whatever had
+            # already been legitimately computed on earlier turns --
+            # computed_risk_score, explanation, top_factors, and the full
+            # tool-call trace -- even though every other "agent didn't
+            # finish normally" exit path (the loop simply running out of
+            # turns, two lines below the loop) deliberately preserves and
+            # gates that same data instead of throwing it away. The net
+            # effect was an opaque, evidence-free manual-review record with
+            # no diagnostic trail, in place of a real gated decision the
+            # already-computed score could have produced. Fail safe using
+            # whatever is already known, the same way running out of turns
+            # does, instead of letting a mid-loop API hiccup erase it.
+            return _fail_safe_result(
+                computed_risk_score, explanation, top_factors, trace, on_step,
+                event_type="api_error",
+                reason_without_score="The agent's reasoning could not be completed (a language-model API call failed) -- routed for manual review.",
+            )
 
         if message.tool_calls:
             messages.append({"role": "assistant", "content": message.content or "", "tool_calls": message.tool_calls})
@@ -239,23 +260,39 @@ def run_risk_agent(
         return _finalize(agent_proposal, final_text, computed_risk_score, explanation, top_factors, trace, on_step)
 
     # Ran out of turns without a final answer -- fail safe rather than guess.
+    return _fail_safe_result(
+        computed_risk_score, explanation, top_factors, trace, on_step,
+        event_type="timeout",
+        reason_without_score="Agent did not complete its investigation within the allotted turns.",
+    )
+
+
+def _fail_safe_result(computed_risk_score, explanation, top_factors, trace, on_step, event_type: str, reason_without_score: str) -> dict:
+    """
+    Shared by every "the agent didn't reach a normal submit_decision call"
+    exit path (running out of turns, and a mid-loop LLM API failure) --
+    whatever was already legitimately computed (a risk score from
+    score_transaction_risk, an explanation, and the tool-call trace so far)
+    is preserved and gated for real, exactly as if the agent had reached
+    that point and simply failed to submit a final answer, rather than
+    being silently discarded. Only when NO score was ever computed does
+    this fall back to a plain needs_manual_review with no comparison to
+    make.
+    """
     gating_result = decide_from_score(computed_risk_score)
     gated_decision = gating_result.decision if computed_risk_score is not None else "needs_manual_review"
-    _emit(on_step, {"type": "timeout", "gated_decision": gated_decision})
+    _emit(on_step, {"type": event_type, "gated_decision": gated_decision})
     return {
         "agent_proposal": None,
         "agent_raw_response": None,
         "gated_decision": gated_decision,
-        "gated_reason": (
-            gating_result.reason
-            if computed_risk_score is not None
-            else "Agent did not complete its investigation within the allotted turns."
-        ),
+        "gated_reason": gating_result.reason if computed_risk_score is not None else reason_without_score,
         "risk_score": computed_risk_score,
         "explanation": explanation,
         "top_factors": top_factors,
         "agent_and_gate_agree": None,
         "trace": trace,
+        "thresholds_used": gating_result.thresholds_used,
     }
 
 
@@ -298,6 +335,7 @@ def _finalize(agent_proposal, agent_raw_response, computed_risk_score, explanati
         "explanation": explanation,
         "top_factors": top_factors,
         "agent_and_gate_agree": agreement,
+        "thresholds_used": gating_result.thresholds_used,
         "trace": trace,
     }
 

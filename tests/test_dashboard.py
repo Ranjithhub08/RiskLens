@@ -203,6 +203,25 @@ def test_live_agent_razorpay_error_message_is_escaped_before_rendering():
     assert "&lt;img" in rendered
 
 
+def test_resolve_manual_entry_merchant_id_passes_through_a_real_sample_merchant():
+    assert dashboard.resolve_manual_entry_merchant_id("merchant_1001") == "merchant_1001"
+
+
+def test_resolve_manual_entry_merchant_id_makes_manual_entries_unique():
+    # Regression test: every manual-entry investigation used to share the
+    # exact literal "manual-entry" merchant_id -- two unrelated manual
+    # investigations were logged under an identical id, silently
+    # undercounting distinct investigations in Overview's set()-deduped
+    # KPIs. A unique suffix must be generated per call.
+    counter = iter(["aaaa1111", "bbbb2222"])
+    first = dashboard.resolve_manual_entry_merchant_id("manual-entry", generate_suffix=lambda: next(counter))
+    second = dashboard.resolve_manual_entry_merchant_id("manual-entry", generate_suffix=lambda: next(counter))
+
+    assert first != second
+    assert first.startswith("manual-entry-")
+    assert second.startswith("manual-entry-")
+
+
 def test_audit_trail_merchant_search_does_not_crash_on_regex_metacharacters():
     # page_audit_trail()'s "Search merchant ID" box filters with this exact
     # pandas expression. It's a plain free-text field (the sibling search on

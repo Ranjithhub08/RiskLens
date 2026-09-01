@@ -84,6 +84,13 @@ _NUMERIC_NONNEGATIVE_COLUMNS = {
 # here instead routes it to manual review like any other invalid field.
 _NUMERIC_MAX = 1e12
 
+# A floor on avg_30d_txn_volume specifically, well below anything a real
+# merchant snapshot has ever had (the real training data's minimum is
+# ~186; this is set far lower still so it never rejects a genuinely small
+# but real merchant) -- see its use below, next to volume_change_pct's
+# division by this same field.
+_MIN_AVG_VOLUME = 1.0
+
 
 def find_missing_or_invalid(df: pd.DataFrame) -> list:
     """
@@ -134,6 +141,18 @@ def find_missing_or_invalid(df: pd.DataFrame) -> list:
         if isinstance(val, (list, tuple, dict, set, np.ndarray)):
             problems.append(col)
             continue
+        # A JSON/agent-tool-call boolean (True/False) is not a "value the
+        # model has never seen" -- it's not a numeric value at all, even
+        # though float(True)/float(False) succeed (1.0/0.0) and would
+        # otherwise sail through every check below as if it were a
+        # perfectly ordinary 0 or 1. bool is a subclass of int in Python,
+        # so this must be checked explicitly and before the numeric
+        # conversion further down, or a hallucinated tool call like
+        # {"account_age_days": true} scores normally with no warning
+        # instead of failing safe to manual review.
+        if isinstance(val, bool):
+            problems.append(col)
+            continue
         if val is None or (isinstance(val, float) and np.isnan(val)) or pd.isna(val):
             problems.append(col)
             continue
@@ -160,6 +179,25 @@ def find_missing_or_invalid(df: pd.DataFrame) -> list:
                 problems.append(col)
                 continue
             if not np.isfinite(num) or num < 0 or num > _NUMERIC_MAX:
+                problems.append(col)
+            elif col == "avg_30d_txn_volume" and num < _MIN_AVG_VOLUME:
+                # volume_change_pct (in transform_features below) is
+                # (daily_txn_volume - avg_30d_txn_volume) / avg_30d_txn_volume,
+                # smoothed only by a tiny EPS to avoid a literal
+                # ZeroDivisionError -- EPS does nothing to bound the RESULT.
+                # A merchant with avg_30d_txn_volume at or near 0 (a
+                # perfectly realistic non-negative value that passes every
+                # check above) combined with any real daily_txn_volume
+                # produces a volume_change_pct in the billions, a value the
+                # model has never seen in training (the real training data's
+                # lowest avg_30d_txn_volume is ~186 and volume_change_pct
+                # never exceeds roughly +/-0.5) -- exactly the "value the
+                # model has never seen" problem _NUMERIC_MAX exists to catch
+                # for raw fields, but for a *derived* feature that
+                # individually-valid raw fields can still produce. Failing
+                # safe here, on the raw denominator field, is simpler and
+                # more transparent to a reviewer than trying to bound the
+                # derived feature after the fact.
                 problems.append(col)
     # Cross-field check: chargebacks/refunds can never exceed the total
     # transaction count they're drawn from. Each field passes the
