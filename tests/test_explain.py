@@ -15,13 +15,25 @@ The fix decouples the two questions: shap_value still (and only) decides
 which heading a factor is listed under (raising vs. lowering the score);
 the phrase's actual wording is grounded in the feature's own value via
 _FEATURE_IS_ELEVATED.
+
+Follow-up bug found live in a later round: decoupling those two questions
+opened a new one -- the wording and the bucket can now point opposite ways
+for the *same* factor (a genuine volume spike with a small net
+risk-REDUCING SHAP contribution, for instance), producing a flatly
+self-contradictory sentence like "factors lowering the risk score:
+transaction volume has spiked well above this merchant's own 30-day
+average". Confirmed this happens on ~6% of top-factor mentions even with a
+correctly-trained model, not just a stale/undertrained one.
+RiskExplainer.explain_row now calls this out explicitly via
+_factor_phrase's "unusual combination" caveat instead of silently
+producing a phrase that contradicts its own heading.
 """
 
 import joblib
 import pandas as pd
 import pytest
 
-from explainability.explain import RiskExplainer, _phrase_for
+from explainability.explain import RiskExplainer, _factor_phrase, _phrase_for
 from features.features import transform_features
 
 MODEL_PATH = "model/artifacts/xgb_model.joblib"
@@ -68,6 +80,79 @@ def test_phrase_for_category_features_unaffected_by_the_fix():
     # raw-value wording fix.
     phrase = _phrase_for("category_electronics", shap_value=0.2, raw_value=1.0)
     assert "associated with higher risk" in phrase
+
+
+def test_factor_phrase_flags_a_spike_whose_shap_sign_disagrees_with_its_raw_value():
+    # Found live: a genuine volume spike (raw_value well past the 0.8
+    # "elevated" cutoff) can carry a NEGATIVE SHAP contribution in
+    # combination with a merchant's other signals -- _phrase_for correctly
+    # words that as "spiked" (grounded in the raw value, not the SHAP sign,
+    # per its own docstring), but explain_row used to then file that exact
+    # phrase under "factors lowering the risk score" with no acknowledgment
+    # of the tension -- a flatly self-contradictory sentence ("... lowering
+    # the risk score: transaction volume has spiked...") that reads as a
+    # bug even though every individual fact in it is true. _factor_phrase
+    # must call out the conflict instead of silently returning a phrase
+    # that contradicts the bucket it's about to be filed under.
+    phrase = _factor_phrase("volume_change_pct", shap_value=-0.1, raw_value=1.5)
+    assert "spiked" in phrase
+    assert "unusual combination" in phrase
+
+
+def test_factor_phrase_flags_the_opposite_direction_conflict_too():
+    # A raw value that's clearly NOT elevated (in line with normal pattern)
+    # but carries a POSITIVE SHAP value (pushing risk up) is the same
+    # conflict in the other direction -- must also be flagged.
+    phrase = _factor_phrase("volume_change_pct", shap_value=0.1, raw_value=0.05)
+    assert "normal pattern" in phrase
+    assert "unusual combination" in phrase
+
+
+def test_factor_phrase_does_not_flag_when_wording_and_shap_sign_agree():
+    # Sanity check the flag isn't just always-on: when the raw value and
+    # SHAP sign point the same way, no caveat should be added.
+    spiking_and_raising = _factor_phrase("volume_change_pct", shap_value=0.2, raw_value=1.5)
+    assert "unusual combination" not in spiking_and_raising
+
+    normal_and_lowering = _factor_phrase("volume_change_pct", shap_value=-0.2, raw_value=0.05)
+    assert "unusual combination" not in normal_and_lowering
+
+
+def test_factor_phrase_is_unaffected_for_features_with_no_elevated_concept():
+    # category_* features have no _FEATURE_IS_ELEVATED entry (their phrase
+    # is an attribution claim, not a factual one -- see _phrase_for) and so
+    # can never conflict; must never carry the caveat.
+    phrase = _factor_phrase("category_electronics", shap_value=0.2, raw_value=1.0)
+    assert "unusual combination" not in phrase
+
+
+def test_explain_row_surfaces_the_caveat_from_a_real_scored_case():
+    # End-to-end check against the exact scenario that surfaced this bug
+    # live: a merchant whose transaction is a ~30x spike over its own
+    # 30-day average. Whichever way this particular model's SHAP happens
+    # to sign that feature, the resulting sentence must be internally
+    # consistent -- either the spike phrase and its bucket agree, or the
+    # conflict is called out explicitly. It must never silently contradict
+    # itself.
+    model = joblib.load(MODEL_PATH)
+    explainer = RiskExplainer(model)
+
+    row = pd.DataFrame([{
+        "merchant_id": "m1", "account_age_days": 682, "kyc_status": "complete",
+        "business_category": "travel", "daily_txn_volume": 100000.0,
+        "avg_30d_txn_volume": 3290.04, "total_txns_30d": 2078,
+        "chargebacks_30d": 8, "refunds_30d": 31, "avg_ticket_size": 3007.65,
+    }])
+    X = transform_features(row)
+    result = explainer.explain_row(X)
+
+    volume_change_pct = X["volume_change_pct"].iloc[0]
+    assert volume_change_pct > 0.8, "test fixture must actually be a genuine spike"
+
+    volume_factor = next(f for f in result["top_factors"] if f["feature"] == "volume_change_pct")
+    if volume_factor["shap_value"] < 0:
+        assert "unusual combination" in result["explanation"]
+    assert "spiked" in result["explanation"]
 
 
 @pytest.mark.skipif(not __import__("os").path.exists(MODEL_PATH), reason="requires a trained model artifact")
