@@ -890,12 +890,34 @@ def model_comparison_table_html(xgb: dict, base: dict, left_label: str = "XGBoos
         ("F1", xgb["f1"], base["f1"]),
         ("ROC-AUC", xgb["roc_auc"], base["roc_auc"]),
     ]
-    body_rows = "".join(
-        f'<tr><td style="padding:9px 14px 9px 0; color:var(--rl-text-dim); border-top:1px solid var(--rl-border);">{label}</td>'
-        f'<td style="padding:9px 14px; text-align:right; font-family:\'Space Grotesk\',sans-serif; font-weight:600; border-top:1px solid var(--rl-border); color:{"var(--rl-text)" if xg >= bl else "var(--rl-text-dim)"};">{xg:.3f}{" &#9679;" if xg >= bl else ""}</td>'
-        f'<td style="padding:9px 0 9px 14px; text-align:right; font-family:\'Space Grotesk\',sans-serif; font-weight:600; border-top:1px solid var(--rl-border); color:{"var(--rl-text)" if bl > xg else "var(--rl-text-dim)"};">{bl:.3f}{" &#9679;" if bl > xg else ""}</td></tr>'
-        for label, xg, bl in comparable_rows
-    )
+
+    def _row_html(label, xg, bl):
+        # Compared at the same 3-decimal precision the numbers are actually
+        # displayed at (not the raw floats) -- otherwise a difference far
+        # past the third decimal (e.g. 0.3981 vs 0.3979) would render as a
+        # "win" dot next to two numbers that print as the identical 0.398,
+        # which looks like the table is contradicting itself.
+        #
+        # A genuine tie (as `xg >= bl` used to treat every tie, always
+        # crediting the LEFT column) is not a win for either side -- it
+        # previously marked the candidate model in "Retrain from feedback"
+        # as beating the deployed model on every metric even when a
+        # single extra feedback row left the retrained model performing
+        # IDENTICALLY to what's already live, which is a materially
+        # misleading claim on a page whose whole purpose is telling
+        # someone whether a promotion is actually justified. Ties now get
+        # no dot and no dimming on either side.
+        xg_r, bl_r = round(xg, 3), round(bl, 3)
+        xg_wins, bl_wins = xg_r > bl_r, bl_r > xg_r
+        xg_color = "var(--rl-text-dim)" if bl_wins else "var(--rl-text)"
+        bl_color = "var(--rl-text-dim)" if xg_wins else "var(--rl-text)"
+        return (
+            f'<tr><td style="padding:9px 14px 9px 0; color:var(--rl-text-dim); border-top:1px solid var(--rl-border);">{label}</td>'
+            f'<td style="padding:9px 14px; text-align:right; font-family:\'Space Grotesk\',sans-serif; font-weight:600; border-top:1px solid var(--rl-border); color:{xg_color};">{xg:.3f}{" &#9679;" if xg_wins else ""}</td>'
+            f'<td style="padding:9px 0 9px 14px; text-align:right; font-family:\'Space Grotesk\',sans-serif; font-weight:600; border-top:1px solid var(--rl-border); color:{bl_color};">{bl:.3f}{" &#9679;" if bl_wins else ""}</td></tr>'
+        )
+
+    body_rows = "".join(_row_html(label, xg, bl) for label, xg, bl in comparable_rows)
     body_rows += (
         f'<tr><td style="padding:9px 14px 9px 0; color:var(--rl-text-dim); border-top:1px solid var(--rl-border);">Decision threshold '
         f'<span style="color:var(--rl-text-muted); font-size:0.68rem;">(own tuned point, not a competition score)</span></td>'

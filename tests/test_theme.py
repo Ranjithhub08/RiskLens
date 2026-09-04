@@ -51,3 +51,51 @@ def test_risk_scale_html_draws_no_marker_for_none():
 def test_risk_scale_html_draws_a_marker_for_an_ordinary_score():
     html_out = theme.risk_scale_html(0.5)
     assert "rl-scale-marker" in html_out
+
+
+# model_comparison_table_html's "winner" dot previously used a bare `xg >=
+# bl` comparison, which meant an exact tie was always credited to the LEFT
+# column as though it had won. That's most visible (and most misleading) on
+# the Models page's "Retrain from feedback" section: a single extra
+# feedback row folded into 6000+ original rows can easily leave a candidate
+# model performing IDENTICALLY to what's already deployed, and the table
+# was claiming the candidate beat the deployed model on every metric when
+# it hadn't beaten it on any of them.
+def _metrics(precision, recall, f1, roc_auc, threshold=0.5):
+    return {"precision": precision, "recall": recall, "f1": f1, "roc_auc": roc_auc, "threshold": threshold}
+
+
+def _body_rows_html(html_out: str) -> str:
+    """Strips the trailing "&#9679; marks the stronger model" caption (which
+    always contains one literal &#9679; of its own) so tests can count only
+    the winner dots actually placed in the table body."""
+    return html_out.split("<tbody>")[1].split("</tbody>")[0]
+
+
+def test_model_comparison_table_marks_no_winner_on_an_exact_tie():
+    tied = _metrics(0.398, 0.519, 0.451, 0.756)
+    html_out = theme.model_comparison_table_html(tied, tied)
+    assert _body_rows_html(html_out).count("&#9679;") == 0
+
+
+def test_model_comparison_table_marks_no_winner_on_a_tie_at_display_precision():
+    # 0.3981 and 0.3979 both print as "0.398" -- a win dot next to two
+    # numbers that read identically would look like the table is
+    # contradicting itself, so ties are judged at the same 3-decimal
+    # precision the numbers are actually displayed at.
+    left = _metrics(0.3981, 0.519, 0.451, 0.756)
+    right = _metrics(0.3979, 0.519, 0.451, 0.756)
+    html_out = theme.model_comparison_table_html(left, right)
+    assert _body_rows_html(html_out).count("&#9679;") == 0
+
+
+def test_model_comparison_table_still_marks_a_genuine_winner():
+    stronger = _metrics(0.50, 0.519, 0.451, 0.756)
+    weaker = _metrics(0.30, 0.519, 0.451, 0.756)
+    html_out = theme.model_comparison_table_html(stronger, weaker)
+    body = _body_rows_html(html_out)
+    # Exactly one dot: only Precision differs, and it favors `stronger`.
+    assert body.count("&#9679;") == 1
+    precision_row = body.split("Precision</td>")[1].split("</tr>")[0]
+    assert "0.500 &#9679;" in precision_row
+    assert "0.300 &#9679;" not in precision_row
