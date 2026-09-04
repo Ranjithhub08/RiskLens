@@ -11,7 +11,7 @@ Payment platforms flag or freeze merchant accounts when activity looks risky —
 
 RiskLens is a decision-support system that scores merchant/transaction risk, explains every score in plain language, and never takes an irreversible action on its own — it recommends, logs, and escalates, with a full audit trail behind every decision.
 
-RiskLens ships two ways to reach a decision, sharing the same model, explainer, gating rules, and audit log underneath: a **deterministic pipeline** (`pipeline.py`, the "Score a case" tab) for instant, fully-scripted scoring, and an **agentic pipeline** (`agent_pipeline.py`, the "Live agent" tab) where an LLM reasons over a *real* Razorpay test-mode transaction, decides which tools to call, and proposes a decision — which the same fixed gating rules then check before anything is treated as final. Section 11 covers the agentic layer in full.
+RiskLens ships two ways to reach a decision, sharing the same model, explainer, gating rules, and audit log underneath: a **deterministic pipeline** (`pipeline.py`, the "Investigations" tab) for instant, fully-scripted scoring, and an **agentic pipeline** (`agent_pipeline.py`, the "Live agent" tab) where an LLM reasons over a *real* Razorpay test-mode transaction, decides which tools to call, and proposes a decision — which the same fixed gating rules then check before anything is treated as final. Section 11 covers the agentic layer in full.
 
 ## 2. Goals and Non-Goals
 
@@ -65,7 +65,7 @@ This diagram is the deterministic path. The agentic path (Section 11) replaces s
 - All transformations live in one `features.py` module so training and inference use *identical* logic — a common source of silent bugs when the two drift apart.
 
 ### 4.3 Model Layer
-- **Algorithm:** XGBoost classifier (binary: risky vs. not risky), with a simpler logistic regression baseline trained alongside it purely for comparison — this gives you a credible "we tried a simple baseline and beat it by X%" line for the panel.
+- **Algorithm:** XGBoost classifier (binary: risky vs. not risky), with a simpler logistic regression baseline trained alongside it purely for comparison. On the current held-out test set, XGBoost's lift over that baseline is real but metric-specific, not universal: it wins on ROC-AUC (0.756 vs. 0.734, a genuine improvement in how well it ranks risky merchants above safe ones across every threshold) and on precision, but the baseline actually edges it slightly on recall and F1 at each model's own tuned threshold. Be ready to make the honest case for XGBoost on ROC-AUC and native SHAP support rather than claiming a clean F1 win it doesn't have — see Section 4.5's threshold note and the Models page for the live numbers.
 - **Split strategy:** time-based train/test split (train on earlier data, test on later data) rather than random split — this is more realistic for a fraud/risk use case and shows methodological maturity if a judge asks about it.
 - **Evaluation metrics:** precision, recall, F1, ROC-AUC, and a confusion matrix, all computed on the held-out test set and saved to a metrics report — this directly satisfies the track's stated judging bar.
 - **Artifact:** trained model saved via `joblib`, versioned with a timestamp, loaded by both the API/dashboard and any batch scoring script.
@@ -297,7 +297,7 @@ One more boundary worth stating plainly: a case's own decision reason or an over
 - Future extension: graph-based "abuse-ring" detection (linking related accounts), which the buildathon also lists as an example under this track.
 - The agentic path's *transaction* data (Order amount, ID, timestamp) is real, live Razorpay test-mode data; the *merchant history* it's paired with (KYC status, chargeback rate, account age) is simulated per Section 11.2's explanation — no publicly available API, sandbox or otherwise, provides real merchant KYC/risk history to a student project.
 - The agent's investigation quality depends on the underlying LLM (Groq/Llama 3.3 70B here); a different or future model could investigate more or less thoroughly for the same prompt. The gate's behavior does not depend on the LLM at all, which is exactly why the gate — not the agent — is the safety boundary.
-- `MAX_TURNS` is a fixed cap (6) chosen for demo responsiveness; a production system would likely tune this against real latency/cost/thoroughness tradeoffs.
+- `MAX_TURNS` is a fixed cap (8) chosen to comfortably fit the system prompt's described investigation (up to 3 mandatory + 2 optional tool calls) plus a final answer, with the last turn forcing a `submit_decision` tool call rather than letting the model keep investigating past its budget — an earlier, tighter cap (6) could be exhausted by a thorough investigation before the agent ever produced a proposal, which silently inflated the "ran out of turns" fail-safe rate. A production system would still tune this against real latency/cost/thoroughness tradeoffs rather than the fixed value used here.
 
 ---
 
