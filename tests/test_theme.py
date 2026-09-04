@@ -30,7 +30,7 @@ def test_risk_label_for_infinite_is_unscored():
 
 def test_risk_label_for_ordinary_scores_is_unaffected():
     assert theme.risk_label_for_score(0.10)[0] == "Low risk"
-    assert theme.risk_label_for_score(0.55)[0] == "Elevated risk"
+    assert theme.risk_label_for_score(0.52)[0] == "Elevated risk"
     assert theme.risk_label_for_score(0.90)[0] == "High risk"
 
 

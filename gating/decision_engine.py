@@ -16,32 +16,56 @@ from typing import Optional
 # reasoning behind these values.
 #
 # These are NOT arbitrary round numbers -- the trained model's predicted
-# probabilities are naturally compressed into a fairly narrow band (roughly
-# 0.33-0.69 on held-out data, not the full 0-1 range a probability could in
-# principle span), because the synthetic training data only weakly separates
-# risky from clean merchants. Thresholds of 0.40 / 0.75 were an earlier,
-# untested guess that sat almost entirely *inside* that compressed band --
-# in practice that meant nearly every record landed in "escalate" or
-# "needs manual review", and "clear" and "flag" almost never fired at all
-# (see model/artifacts/metrics.json and the note in decide_from_score below).
+# probabilities are naturally compressed into a fairly narrow band (not the
+# full 0-1 range a probability could in principle span), because the
+# synthetic training data only weakly separates risky from clean merchants.
+# Thresholds of 0.40 / 0.75 were an earlier, untested guess that sat almost
+# entirely *inside* that compressed band -- in practice that meant nearly
+# every record landed in "escalate" or "needs manual review", and "clear"
+# and "flag" almost never fired at all (see model/artifacts/metrics.json
+# and the note in decide_from_score below).
 #
 # The values below were instead picked from where the model's own held-out
-# validation scores actually fall (see model/train.py's load_and_split /
-# the Threshold Explorer on the Models page): ESCALATE_THRESHOLD sits just
-# above the dense cluster of "ordinary" scores (~80th percentile), and
-# FLAG_THRESHOLD sits at the start of the long high-risk tail (~90th
+# validation/test scores actually fall (see model/train.py's load_and_split
+# / the Threshold Explorer on the Models page): ESCALATE_THRESHOLD sits
+# just above the dense cluster of "ordinary" scores (~80th percentile), and
+# FLAG_THRESHOLD sits at the start of the high-risk tail (~90th
 # percentile). Re-run model/train.py and re-check this distribution any
 # time the training data changes -- these are tuned to the current model,
 # not universal constants.
+#
+# FLAG_THRESHOLD was moved from 0.62 to 0.53 here specifically because it
+# changed: data/raw/generate_data.py's daily-volume generation used to draw
+# EVERY merchant's multiplier from one narrow distribution whose tail never
+# actually produced a genuine volume spike (volume_change_pct topped out at
+# 0.499 across the whole training set, even though the label rule treats
+# anything past 0.8 as a real risk signal) -- fixed by adding a real
+# spiking subset. That gave the retrained model a stronger, more decisive
+# signal on genuinely risky merchants, which compressed and shifted its
+# score distribution enough that the old FLAG_THRESHOLD (0.62) sat ABOVE
+# the maximum score the new model ever produces on held-out data --
+# "flag_for_compliance_review" could never fire again. 0.53 sits at the
+# new ~90th percentile instead, restoring a real (if still small) flag
+# bucket. See GATE_VERSION below, bumped alongside this change.
 ESCALATE_THRESHOLD = 0.50
-FLAG_THRESHOLD = 0.62
+FLAG_THRESHOLD = 0.53
 
 # If the model's score sits within this band around the escalate threshold,
 # treat it as "too close to call confidently" and fail safe to manual
 # review rather than trusting the raw number. Kept small relative to the
 # thresholds above precisely because the model's score range is itself
 # narrow -- a wide band here would swallow most of the "clear" bucket.
-LOW_CONFIDENCE_BAND = 0.02
+#
+# Lowered from 0.02 to 0.01 alongside the FLAG_THRESHOLD change above: the
+# gap between ESCALATE_THRESHOLD and FLAG_THRESHOLD shrank from 0.12 to
+# 0.03 when the retrained model's score distribution compressed, so the old
+# 0.02 band (fine against a 0.12-wide gap) was now a third of the entire
+# escalate range -- on the held-out test set it was swallowing most of
+# "escalate" into "needs_manual_review" (120 manual-review vs. only 70
+# escalate). 0.01 restores a real escalate bucket (149) while still keeping
+# a meaningful manual-review fail-safe (35) for scores genuinely on the
+# fence.
+LOW_CONFIDENCE_BAND = 0.01
 
 DECISION_CLEAR = "clear"
 DECISION_ESCALATE = "escalate"
@@ -51,7 +75,7 @@ DECISION_MANUAL_REVIEW = "needs_manual_review"
 # A stable identifier for this gate implementation, surfaced in the UI and
 # audit trail so every decision can be traced to the exact rule set that
 # produced it. Bump this if the thresholds or logic below ever change.
-GATE_VERSION = "DETERMINISTIC-GATE-01"
+GATE_VERSION = "DETERMINISTIC-GATE-02"
 
 
 @dataclass

@@ -47,8 +47,28 @@ def generate(n_merchants: int = N_MERCHANTS, seed: int = SEED) -> pd.DataFrame:
     avg_30d_txn_volume = rng.lognormal(mean=9.5, sigma=1.1, size=n_merchants)  # ~ INR thousands to lakhs
     total_txns_30d = rng.integers(5, 3000, size=n_merchants)
 
-    # Most merchants have volume close to their own average; a risky subset spikes hard
-    volume_multiplier = rng.normal(loc=1.0, scale=0.15, size=n_merchants)
+    # Most merchants have volume close to their own average; a genuine risky
+    # subset spikes hard -- this comment described the intent from the
+    # start, but the code below it didn't implement it: EVERY merchant's
+    # multiplier used to be drawn from one narrow Normal(1.0, 0.15)
+    # distribution, whose tail practically never reaches 1.8x across 6000
+    # draws (confirmed empirically: the generated dataset's
+    # volume_change_pct topped out at 0.499 -- never once crossing the 0.8
+    # threshold the label rule below treats as a real risk signal). That
+    # meant `3.0 * (volume_change_pct > 0.8)` in risk_score_latent fired
+    # ZERO times during training: the model never saw a single genuine
+    # volume-spike example and had no way to learn that a spike matters, no
+    # matter how clearly the label-generation logic intended it to (found
+    # live: a real 20x demo spike scored as slightly RISK-REDUCING instead
+    # of raising the score, because it fell in a region of feature space
+    # the model was never trained on). A separate, independently-drawn
+    # spiking subset now actually produces daily volumes 1.8x-6x a
+    # merchant's own average, so the >0.8 branch has real, learnable
+    # examples on both sides of it.
+    is_spiking = rng.random(n_merchants) < 0.08
+    normal_multiplier = rng.normal(loc=1.0, scale=0.15, size=n_merchants)
+    spike_multiplier = rng.uniform(1.8, 6.0, size=n_merchants)
+    volume_multiplier = np.where(is_spiking, spike_multiplier, normal_multiplier)
     daily_txn_volume = avg_30d_txn_volume * np.clip(volume_multiplier, 0.3, None)
 
     chargebacks_30d = rng.poisson(lam=total_txns_30d * 0.004)
