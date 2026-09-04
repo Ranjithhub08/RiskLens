@@ -14,6 +14,7 @@ separate, deliberate, auditable step.
 
 import json
 import os
+import shutil
 import uuid
 
 import joblib
@@ -25,7 +26,12 @@ from xgboost import XGBClassifier
 
 from audit.audit_log import get_all_overrides, get_event_by_id
 from features.features import RAW_REQUIRED_COLUMNS, find_missing_or_invalid, transform_features
-from gating.decision_engine import DECISION_CLEAR, DECISION_MANUAL_REVIEW
+from gating.decision_engine import (
+    DECISION_CLEAR,
+    DECISION_ESCALATE,
+    DECISION_FLAG,
+    DECISION_MANUAL_REVIEW,
+)
 from model.train import (
     RAW_DATA_PATH,
     TRAIN_FRACTION,
@@ -191,7 +197,25 @@ def build_feedback_rows(conn) -> pd.DataFrame:
         # case already is, rather than guessed at either way.
         if override["overridden_decision"] == DECISION_MANUAL_REVIEW:
             continue
-        features["is_risky"] = 0 if override["overridden_decision"] == DECISION_CLEAR else 1
+        # Only the three known outcomes are handled explicitly: "clear" is
+        # ground-truth not-risky, "escalate"/"flag_for_compliance_review"
+        # are ground-truth risky, and needs_manual_review was already
+        # skipped above. human_overrides has no CHECK constraint on
+        # overridden_decision (see audit/audit_log.py's log_override), and
+        # log_override itself doesn't validate it either -- both
+        # deliberately, since a reviewer must be able to record any
+        # decision string an unforeseen future workflow produces. But that
+        # means a typo, a renamed DECISION_* constant, or any value this
+        # function doesn't recognize must be SKIPPED, not silently folded
+        # in as a confirmed-risky (is_risky=1) label -- the same "skip
+        # rather than guess" rule this function already applies to an
+        # invalid feature row, just extended to the label itself.
+        if override["overridden_decision"] == DECISION_CLEAR:
+            features["is_risky"] = 0
+        elif override["overridden_decision"] in (DECISION_ESCALATE, DECISION_FLAG):
+            features["is_risky"] = 1
+        else:
+            continue
         features["snapshot_date"] = override["timestamp_utc"]
         rows.append(features)
     return pd.DataFrame(rows)
@@ -455,9 +479,50 @@ def promote_candidate(
         # into place. Model and threshold go first and back-to-back (the
         # pair whose mutual consistency actually drives gating decisions);
         # the purely-cosmetic report artifacts follow.
-        for final_path in [MODEL_PATH, THRESHOLD_PATH, METRICS_PATH, TEST_SNAPSHOT_PATH, CHART_DATA_PATH]:
-            if final_path in tmp_paths:
+        #
+        # Each individual os.replace() below is atomic, but the SET of them
+        # isn't: if one swap in the middle fails (a full disk, a
+        # permissions error, an OOM-kill between two syscalls), the swaps
+        # already completed before it are not automatically undone -- a
+        # previous version of this function left exactly that behind: a
+        # brand-new model already live on disk paired with the OLD, stale
+        # threshold, while promote_candidate itself reported the promotion
+        # as FAILED (raised an exception) -- a silently wrong gate with no
+        # indication anything was left inconsistent. Guarded here by
+        # backing up each live file (a plain copy, made just before that
+        # file is touched) so a mid-loop failure can restore every
+        # already-swapped file back to its exact pre-promotion content
+        # before the exception propagates.
+        backup_paths = {}
+        swapped = []
+        try:
+            for final_path in [MODEL_PATH, THRESHOLD_PATH, METRICS_PATH, TEST_SNAPSHOT_PATH, CHART_DATA_PATH]:
+                if final_path not in tmp_paths:
+                    continue
+                if os.path.exists(final_path):
+                    backup_path = f"{final_path}.rollback.{promote_id}"
+                    shutil.copy2(final_path, backup_path)
+                    backup_paths[final_path] = backup_path
                 os.replace(tmp_paths[final_path], final_path)
+                swapped.append(final_path)
+        except Exception:
+            # Restore every file that was already swapped forward, most
+            # recently swapped first, before re-raising -- otherwise the
+            # exception below would leave exactly the inconsistent on-disk
+            # state (new model, stale threshold) this rollback exists to
+            # prevent.
+            for already_swapped in reversed(swapped):
+                if already_swapped in backup_paths:
+                    os.replace(backup_paths[already_swapped], already_swapped)
+                elif os.path.exists(already_swapped):
+                    # No pre-existing file to restore -- this promotion
+                    # would have created it from nothing, so undo that too.
+                    os.remove(already_swapped)
+            raise
+        finally:
+            for backup_path in backup_paths.values():
+                if os.path.exists(backup_path):
+                    os.remove(backup_path)
     except Exception:
         for tmp_path in tmp_paths.values():
             if os.path.exists(tmp_path):

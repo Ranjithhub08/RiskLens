@@ -471,3 +471,60 @@ def test_finalize_still_handles_a_well_formed_dict_proposal():
         trace=[],
     )
     assert result["agent_proposal"]["recommended_decision"] == "escalate"
+
+
+def test_buggy_on_step_callback_does_not_lose_an_already_computed_score(tools):
+    # Regression test (round 7): on_step is a best-effort progress callback
+    # for a live UI -- a bug in IT (a typo'd dict key, a Streamlit
+    # widget-state exception, any assumption about the event shape that
+    # later drifts) used to propagate straight out of run_risk_agent and
+    # discard whatever score/explanation/trace had already been
+    # legitimately computed, exactly like the mid-loop API-failure bug
+    # fixed above, just triggered by the UI side instead of the LLM side.
+    scripted = ScriptedGroqClient(
+        [
+            _response(_tool_message([_tool_call("1", "score_transaction_risk", MERCHANT_ARGS)])),
+            _response(_tool_message([_tool_call("2", "explain_transaction_risk", MERCHANT_ARGS)])),
+            _response(_final_message(json.dumps({"recommended_decision": "clear", "reasoning": "Low risk."}))),
+        ]
+    )
+
+    def buggy_on_step(event):
+        raise KeyError("simulated UI bug: assumed key not present")
+
+    result = run_risk_agent(
+        {"merchant_id": "AGT7", "daily_txn_volume": 9000}, tools, groq_client=scripted, on_step=buggy_on_step
+    )
+
+    # Must not raise, and must still return the real, fully-computed result
+    # -- not silently fall back to a trace-free manual review.
+    assert result["risk_score"] is not None
+    assert result["explanation"] is not None
+    assert len(result["trace"]) == 2
+    assert result["agent_proposal"]["recommended_decision"] == "clear"
+
+
+def test_tool_call_with_none_arguments_does_not_crash_the_loop(tools):
+    # Regression test (round 7): tool_call.function.arguments is normally a
+    # JSON string, but a provider/SDK anomaly can hand back None instead of
+    # "{}". json.loads(None) raises TypeError, a different exception class
+    # than the JSONDecodeError this code used to only guard against, so it
+    # fell through uncaught and crashed the whole reasoning loop.
+    malformed_tool_call = SimpleNamespace(
+        id="1",
+        function=SimpleNamespace(name="get_merchant_context", arguments=None),
+    )
+    scripted = ScriptedGroqClient(
+        [
+            _response(_tool_message([malformed_tool_call])),
+            _response(_tool_message([_tool_call("2", "score_transaction_risk", MERCHANT_ARGS)])),
+            _response(_final_message(json.dumps({"recommended_decision": "clear", "reasoning": "Low risk."}))),
+        ]
+    )
+
+    result = run_risk_agent({"merchant_id": "AGT8", "daily_txn_volume": 9000}, tools, groq_client=scripted)
+
+    # Must not raise -- args=None degrades to an empty args dict, same as
+    # malformed JSON text does, and the loop continues normally.
+    assert result["risk_score"] is not None
+    assert result["trace"][0]["tool"] == "get_merchant_context"

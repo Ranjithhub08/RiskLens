@@ -419,3 +419,80 @@ def test_promote_candidate_uses_unique_temp_paths_so_concurrent_promotions_canno
     # Neither call's temp path is left behind -- both promotions succeeded
     # and swapped their (distinct) temp files into place.
     assert list(tmp_path.glob("*.tmp_promote.*")) == []
+
+
+def test_promote_candidate_rolls_back_an_already_swapped_file_if_a_later_swap_fails(tmp_path, monkeypatch):
+    """Regression test (round 7): Phase 1 (write every artifact to a temp
+    file) already had rollback -- this covers Phase 2 (the os.replace()
+    swap-in loop) not having any. Each os.replace() is individually atomic,
+    but the SET of them wasn't: if the model's swap succeeded and the very
+    next swap (the threshold) then failed, promote_candidate raised as
+    expected, but the live model file was left as the NEW candidate while
+    decision_threshold.json was left as the OLD, stale value -- a new model
+    silently paired with a stale threshold, exactly the failure mode this
+    file's own comments claim is impossible. Every already-swapped file
+    must be restored to its pre-promotion content before the exception
+    propagates."""
+    fake_model_path = tmp_path / "candidate_model.joblib"
+    fake_threshold_path = tmp_path / "candidate_threshold.json"
+    fake_metrics_path = tmp_path / "metrics.json"
+    fake_chart_data_path = tmp_path / "chart_data.json"
+    monkeypatch.setattr(feedback_module, "MODEL_PATH", str(fake_model_path))
+    monkeypatch.setattr(feedback_module, "THRESHOLD_PATH", str(fake_threshold_path))
+    monkeypatch.setattr(feedback_module, "METRICS_PATH", str(fake_metrics_path))
+    monkeypatch.setattr(feedback_module, "CHART_DATA_PATH", str(fake_chart_data_path))
+    monkeypatch.setattr(feedback_module, "ARTIFACT_DIR", str(tmp_path))
+
+    # Pre-existing "old model's" artifacts -- these must survive untouched
+    # (or be restored to exactly this) even though the model file's swap
+    # succeeds before the threshold file's swap fails.
+    fake_model_path.write_text("OLD MODEL BYTES")
+    fake_threshold_path.write_text(json.dumps({"xgboost_threshold": 0.50}))
+    fake_metrics_path.write_text(json.dumps({"xgboost": {"f1": 0.1}}))
+    fake_chart_data_path.write_text(json.dumps({"confusion_matrix": {"matrix": [[1, 0], [0, 1]]}}))
+
+    real_os_replace = feedback_module.os.replace
+
+    def flaky_os_replace(src, dst):
+        if dst == str(fake_threshold_path):
+            raise OSError("simulated crash on the threshold swap, right after the model swap succeeded")
+        return real_os_replace(src, dst)
+
+    monkeypatch.setattr(feedback_module.os, "replace", flaky_os_replace)
+
+    candidate_metrics = {"threshold": 0.61, "precision": 0.5, "recall": 0.5, "f1": 0.5, "roc_auc": 0.7}
+    candidate_artifacts = {
+        "test_rows": 100,
+        "test_positive_rate": 0.1,
+        "confusion_matrix": [[80, 10], [5, 5]],
+        "roc_curve": {"fpr": [0.0, 1.0], "tpr": [0.0, 1.0], "auc": 0.7},
+        "shap_global_importance": [{"feature": "account_age_days", "mean_abs_shap": 0.2}],
+    }
+
+    with pytest.raises(OSError, match="simulated crash"):
+        promote_candidate(DummyModel(), 0.61, candidate_metrics, candidate_artifacts)
+
+    # The model file's swap succeeded before the failure, but must have been
+    # rolled back -- the live pair must never be (new model, old threshold).
+    assert fake_model_path.read_text() == "OLD MODEL BYTES"
+    assert json.loads(fake_threshold_path.read_text())["xgboost_threshold"] == 0.50
+    # No leftover temp or rollback-backup files from the failed attempt.
+    assert list(tmp_path.glob("*.tmp_promote.*")) == []
+    assert list(tmp_path.glob("*.rollback.*")) == []
+
+
+def test_build_feedback_rows_skips_an_unrecognized_overridden_decision_instead_of_labeling_it_risky(conn):
+    """Regression test (round 7): build_feedback_rows only ever checked
+    overridden_decision == DECISION_CLEAR to decide is_risky=0; every OTHER
+    value -- including a typo, a renamed DECISION_* constant, or any string
+    a future/unconstrained caller (human_overrides has no CHECK constraint,
+    see audit/audit_log.py's log_override) writes -- silently fell into an
+    `else: is_risky = 1` with no validation, unlike the careful validation
+    this same function applies to the feature columns. A case overridden to
+    some unrecognized decision string must be skipped, not silently folded
+    in as confirmed-risky ground truth."""
+    event_id = log_event(conn, "M1", RULE_SNAPSHOT, 0.5, None, "explanation", "escalate", "reason")
+    log_override(conn, event_id, "escalate", "closed_no_action", "not one of the four real decisions")
+
+    rows = build_feedback_rows(conn)
+    assert len(rows) == 0

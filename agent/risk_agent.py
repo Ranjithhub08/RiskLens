@@ -81,9 +81,23 @@ def _emit(on_step, event: dict) -> None:
     submitted its answer), so the UI can render the investigation as it
     unfolds instead of only after run_risk_agent returns. Every existing
     caller that doesn't pass on_step is unaffected -- this is a no-op then.
+
+    A bug in on_step itself (a UI-side rendering mistake, an assumption
+    about the event dict that later drifts, a Streamlit widget-state
+    exception) must never be allowed to propagate out of here: this is a
+    best-effort progress notification, not part of the investigation
+    itself, and letting it raise used to discard whatever score/
+    explanation/trace had already been legitimately computed by that
+    point -- exactly the same "already-computed result thrown away by an
+    unrelated failure" class of bug already fixed for a mid-loop LLM-API
+    error (see the try/except around client.chat.completions.create below).
+    A broken listener should never silence or crash the speaker.
     """
     if on_step is not None:
-        on_step(event)
+        try:
+            on_step(event)
+        except Exception:
+            pass
 
 
 def summarize_tool_result(tool: str, result) -> str:
@@ -180,8 +194,18 @@ def run_risk_agent(
             for tool_call in message.tool_calls:
                 name = tool_call.function.name
                 try:
+                    # tool_call.function.arguments is documented/typical as
+                    # a JSON string, but a provider/SDK anomaly (a
+                    # malformed or truncated tool-call response) can hand
+                    # back None instead of "{}" -- json.loads(None) raises
+                    # TypeError, a different exception class than the
+                    # JSONDecodeError this used to only guard against, so
+                    # that case fell straight through uncaught and crashed
+                    # the whole reasoning loop, discarding any
+                    # already-computed score exactly like the other
+                    # fail-safe gaps fixed in this file.
                     args = json.loads(tool_call.function.arguments)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, TypeError):
                     args = {}
 
                 # submit_decision is how the model reports ITS OWN final answer, not
