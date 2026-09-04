@@ -12,10 +12,14 @@ set -e
 
 cd "$(dirname "$0")"
 
-if ! python3 -c "import streamlit" >/dev/null 2>&1; then
-    echo "==> Installing dependencies (first run only)..."
-    pip install -r requirements.txt
-fi
+# Always run this (not just when streamlit is missing entirely): pip still
+# checks the version constraints in requirements.txt and upgrades anything
+# that's present but too old, which a plain "is it importable" check would
+# silently skip -- exactly how an outdated pre-installed streamlit (missing
+# the `width=` argument dashboard.py relies on) got past this script once
+# already. Fast and a no-op when everything already satisfies the pins.
+echo "==> Checking dependencies..."
+pip install -q -r requirements.txt
 
 if [ ! -f "data/raw/merchant_snapshots.csv" ]; then
     echo "==> Generating synthetic dataset (first run only)..."
