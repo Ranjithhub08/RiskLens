@@ -36,6 +36,16 @@ Full design rationale, data flow, the agent's reasoning-loop design, and a point
 
 ## Quick start
 
+One command:
+
+```bash
+./start.sh
+```
+
+This installs dependencies, generates the synthetic dataset, trains the model, and launches the dashboard at `http://localhost:8501` -- each step is skipped on re-run if its output already exists, so it's also just how you relaunch after a restart. Without a `.env` file, the dashboard still runs -- Overview, Investigations, Batch Scoring, Models, and Audit Trail all work with no configuration. Only Live Agent needs `GROQ_API_KEY` and your Razorpay TEST-mode keys; `start.sh` copies `.env.example` to `.env` for you to fill in, and the dashboard shows a clear message (not a crash) if they're missing.
+
+Or step by step:
+
 ```bash
 pip install -r requirements.txt
 
@@ -59,8 +69,6 @@ cp .env.example .env
 streamlit run app/dashboard.py
 ```
 
-Without a `.env` file, the dashboard still runs -- Overview, Investigations, Batch Scoring, Models, and Audit Trail all work with no configuration. Only Live Agent needs the two API keys, and it shows a clear message (not a crash) if they're missing.
-
 Streamlit does not reload already-imported modules on its own -- after pulling changes or editing code, fully restart (`lsof -ti:8501 | xargs kill -9` then re-run) rather than just refreshing the browser tab.
 
 Optional API layer:
@@ -71,6 +79,7 @@ uvicorn api.main:app --reload --port 8000
 
 ## What's in here
 
+- `start.sh` — one-command setup + launch (installs dependencies, generates data, trains the model, and starts the dashboard, skipping any step whose output already exists)
 - `data/raw/generate_data.py` — synthetic merchant-snapshot dataset generator (no external data or API keys needed)
 - `features/features.py` — the one shared feature-engineering module used by both training and inference
 - `model/train.py` — trains XGBoost + a logistic-regression baseline, time-based train/val/test split, threshold tuned on validation, metrics + plots saved to `model/artifacts/`
