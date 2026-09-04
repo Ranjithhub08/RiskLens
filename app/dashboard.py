@@ -114,10 +114,33 @@ def load_sample_merchants(n: int = 25):
     return df.sample(n=min(n, len(df)), random_state=7).reset_index(drop=True)
 
 
+# `start.sh` normally generates the dataset and trains the model before the
+# dashboard ever starts, and locally that's still exactly what happens. But a
+# fresh deploy (e.g. Streamlit Community Cloud) only ever runs `streamlit run
+# app/dashboard.py` -- there's no shell step to run those scripts first -- so
+# a brand-new instance would otherwise hit the "no trained model found" error
+# below on its very first load. Bootstrapping here, once, makes a cold deploy
+# self-sufficient: same generator and trainer `start.sh` already uses, same
+# fixed seed, just triggered from inside the app instead of before it.
+if not os.path.exists(RAW_DATA_PATH):
+    with st.spinner("First-time setup: generating the synthetic dataset (~5-10s, only happens once)..."):
+        from data.raw.generate_data import generate
+
+        os.makedirs(os.path.dirname(RAW_DATA_PATH), exist_ok=True)
+        generate().to_csv(RAW_DATA_PATH, index=False)
+
+if not os.path.exists(MODEL_PATH):
+    with st.spinner("First-time setup: training the model (~30-60s, only happens once)..."):
+        from model.train import main as train_model
+
+        train_model()
+
 if not os.path.exists(MODEL_PATH):
     st.error(
-        "No trained model found at `model/artifacts/xgb_model.joblib`. "
-        "Run `python3 data/raw/generate_data.py` then `python3 model/train.py` first."
+        "No trained model found at `model/artifacts/xgb_model.joblib`, and the "
+        "automatic first-run setup above didn't produce one. Run "
+        "`python3 data/raw/generate_data.py` then `python3 model/train.py` "
+        "manually and reload."
     )
     st.stop()
 
