@@ -12,20 +12,46 @@ That's the scoring half. The other half is what happens *after* a decision is ma
 
 Full design rationale, data flow, the agent's reasoning-loop design, and a point-by-point mapping to the buildathon's judging criteria: see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
+## Architecture
+
+```mermaid
+flowchart TD
+    A[Merchant / Transaction Data] --> B[Feature Engineering Layer]
+    B --> C[Risk Model - XGBoost Classifier]
+    C --> D[Explainability Layer - SHAP]
+    D --> E[Gating and Decision Engine]
+    E -->|Low risk| F1[Auto-clear]
+    E -->|Medium risk| F2[Escalate to human reviewer]
+    E -->|High risk| F3[Flag for compliance review]
+    E --> G[Audit Log - append only]
+    F1 --> G
+    F2 --> G
+    F3 --> G
+    G --> H[Dashboard - Streamlit]
+    C --> H
+    D --> H
+```
+
+Every arrow into the Audit Log is intentional: nothing leaves the Gating and Decision Engine without being recorded first. The model and the agentic pipeline (Section 11 of the architecture doc) both only ever *propose* — this gating layer is the one authority neither can bypass. Full rationale for every box and arrow above: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
 ## Screenshots
 
 | Overview | Investigations |
 |---|---|
 | ![Overview page: portfolio KPIs, risk activity and distribution charts, recent investigations](docs/screenshots/overview.png) | ![Investigations page: searchable, filterable case table](docs/screenshots/investigations.png) |
 
-| Live Agent | Model performance |
+| Batch Scoring | Live Agent |
 |---|---|
-| ![Live Agent page: run a real Razorpay test-mode investigation](docs/screenshots/live_agent.png) | ![Models page: XGBoost vs. logistic-regression baseline, ROC curve, confusion matrix](docs/screenshots/models.png) |
+| ![Batch Scoring page: upload a CSV, score an entire portfolio in one pass, ranked report with CSV export](docs/screenshots/batch_scoring.png) | ![Live Agent page: run a real Razorpay test-mode investigation](docs/screenshots/live_agent.png) |
+
+| Model performance | Audit Trail |
+|---|---|
+| ![Models page: XGBoost vs. logistic-regression baseline, ROC curve, confusion matrix](docs/screenshots/models.png) | ![Audit Trail page: system monitoring, decision volume over time, full filterable event log](docs/screenshots/audit_trail.png) |
 
 ## Feature highlights
 
 - **Explainable scoring** — XGBoost + SHAP; every score comes with its top contributing factors in plain language, not just a number.
-- **Bounded, deterministic gate** (`DETERMINISTIC-GATE-01`) — a small, versioned rules layer is the only thing that turns a score into a real decision. The model and the agent both only ever *recommend*.
+- **Bounded, deterministic gate** (`DETERMINISTIC-GATE-02`) — a small, versioned rules layer is the only thing that turns a score into a real decision. The model and the agent both only ever *recommend*. The version number is bumped, and stamped onto every audit row, any time the thresholds or logic behind it change, so no past decision is ever misattributed to a rule set it wasn't actually decided under.
 - **Live agent investigation** — an LLM (via Groq) investigates a real Razorpay test-mode order step by step, streaming its reasoning live rather than just returning a final answer, and can pull similar past cases in the same business category for context.
 - **Human override** — a reviewer can correct any decision with a reason. The original decision is never edited or deleted; the correction is a new, separate, equally immutable record layered on top of it.
 - **Ask about this case** — a natural-language Q&A box on the case detail panel, grounded only in that one case's own recorded data. It has no tools and cannot take or recommend any action -- purely a read-only explainer for a reviewer working through a case.
@@ -94,7 +120,7 @@ uvicorn api.main:app --reload --port 8000
 - `config.py` — loads `GROQ_API_KEY` / `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` from a local `.env` file (see `.env.example`) — never hardcoded, never committed. Also refuses to start against a live-mode Razorpay key (anything not prefixed `rzp_test_`) — this is a test-mode-only demo by design, not just by convention.
 - `app/dashboard.py` + `app/theme.py` — the console UI: a native sidebar-navigated app (Overview, Investigations, Batch Scoring, Live Agent, Models, Audit Trail) with real, interactive (Altair) charts throughout
 - `api/main.py` — optional FastAPI `/score` endpoint, opening a fresh database connection per request so concurrent requests can't corrupt each other's audit rows
-- `tests/` — 95 tests covering feature engineering (including cross-field validation, e.g. chargebacks can never exceed total transactions), gating logic (including NaN/boundary handling), the audit log and override table (including tie-break ordering), the deterministic pipeline, the agentic pipeline (including a Razorpay-failure case that must still reach the audit log), the agent loop, the case Q&A, the feedback/retrain flow with atomic all-or-nothing promotion, the dashboard's HTML-escaping of untrusted fields and crash-safe Audit Trail search, the live-vs-test Razorpay key guard, and concurrent API load (with a scripted fake LLM client so the suite runs fully offline) (`pytest tests/`)
+- `tests/` — 170 tests covering feature engineering (including cross-field validation, e.g. chargebacks can never exceed total transactions), gating logic (including NaN/boundary handling), the audit log and override table (including tie-break ordering), the deterministic pipeline, the agentic pipeline (including a Razorpay-failure case that must still reach the audit log), the agent loop (including that the final turn forces a real proposal instead of silently running out of turns), the case Q&A, the feedback/retrain flow with atomic all-or-nothing promotion, the dashboard's HTML-escaping of untrusted fields, crash-safe Audit Trail search, and honest tie-handling in the model comparison tables, the live-vs-test Razorpay key guard, and concurrent API load (with a scripted fake LLM client so the suite runs fully offline) (`pytest tests/`)
 
 ## What's real vs. simulated
 
