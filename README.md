@@ -1,8 +1,11 @@
 # RiskLens
 
 [![Tests](https://github.com/Ranjithhub08/RiskLens/actions/workflows/tests.yml/badge.svg)](https://github.com/Ranjithhub08/RiskLens/actions/workflows/tests.yml)
+[![Live demo](https://img.shields.io/badge/Live%20demo-risklens--buildathon.streamlit.app-E53935)](https://risklens-buildathon.streamlit.app)
 
 **Explainable, accountable merchant risk & freeze-advisory engine — built for the Razorpay AI Buildathon, AI Risk Manager track.**
+
+**[Try the live demo →](https://risklens-buildathon.streamlit.app)** — Overview, Investigations, Batch Scoring, and Models all work immediately with no setup on your end.
 
 RiskLens scores merchant/transaction risk, explains every score in plain language, and never takes an irreversible action on its own. It classifies into clear / escalate / flag / needs-manual-review, always with a reason, and logs every decision to an append-only audit trail.
 
