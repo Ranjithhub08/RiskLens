@@ -146,6 +146,33 @@ def relative_time(ts_str: str) -> str:
     return f"{int(seconds // 86400)}d ago"
 
 
+def absolute_time(ts_str: str) -> str:
+    """Formats a stored UTC timestamp as a fixed, non-drifting display string.
+
+    Unlike relative_time(), this never changes between reruns for the same
+    underlying event -- it's derived only from the stored timestamp, not from
+    datetime.now(). That stability matters specifically for the selectable
+    "cases_table" st.dataframe in page_investigations(): on Streamlit
+    versions where a dataframe widget's identity hash includes its full
+    serialized content (confirmed for 1.50.0; newer Streamlit whitelists
+    only a few kwargs and excludes the data), any cell value that changes
+    on its own between reruns -- such as relative_time()'s "3m ago" ticking
+    over to "4m ago" while a user is mid-interaction -- causes Streamlit to
+    treat the table as a brand new widget and silently drop its current row
+    selection. That made the whole case-detail panel (including "Ask about
+    this case") vanish after a user took long enough to type a question
+    that a minute boundary passed. Using an absolute timestamp here removes
+    that specific source of unsolicited content drift.
+    """
+    try:
+        ts = datetime.fromisoformat(ts_str)
+    except (ValueError, TypeError):
+        return "—"
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.strftime("%Y-%m-%d %H:%M UTC")
+
+
 def extract_case_view(event: dict) -> dict:
     """Normalizes a rule_pipeline or agent_pipeline audit event into one
     common shape for the Investigations table/detail panel. Every field
@@ -855,7 +882,7 @@ def page_investigations():
                     "Agent": (agent_dec or "—").replace("_", " ").title() if agent_dec else "—",
                     "Gate": (v["decision"] or "—").replace("_", " ").title(),
                     "Final decision": (v["decision"] or "—").replace("_", " ").title(),
-                    "Updated": relative_time(v["timestamp_utc"]),
+                    "Updated": absolute_time(v["timestamp_utc"]),
                 }
             )
 
