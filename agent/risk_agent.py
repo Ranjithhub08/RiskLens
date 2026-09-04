@@ -38,7 +38,23 @@ from gating.decision_engine import decide_from_score
 # tool-use support; if Groq's lineup changes again, check
 # https://console.groq.com/docs/models for the current model list.
 DEFAULT_MODEL = "openai/gpt-oss-120b"
-MAX_TURNS = 6
+# Found live: every real Live Agent demo run observed so far ended with "No
+# proposal" -- the agent completed its investigation (up to 5 tool calls:
+# get_merchant_context, score_transaction_risk, explain_transaction_risk,
+# plus the two optional lookups the system prompt below invites) but never
+# actually called submit_decision, so run_risk_agent hit its "ran out of
+# turns" fail-safe every single time. At the old MAX_TURNS=6, a thorough
+# investigation that used both optional tools consumed all 6 turns on
+# investigation alone, leaving zero turns for the model to ever submit a
+# final answer -- the turn budget itself made the flagship "agent proposes,
+# gate decides" comparison structurally unable to produce a proposal on
+# exactly the most thorough (and most interesting to watch) runs. Raised to
+# 8 for headroom, and paired with forcing tool_choice to submit_decision on
+# the actual final turn (see the loop below) so running out of turns without
+# a proposal should now require the model to keep calling investigative
+# tools even when forced to answer -- not just an ordinary thorough
+# investigation.
+MAX_TURNS = 8
 
 SYSTEM_PROMPT = """You are RiskLens, a risk-review agent for a payments platform operating
 in India on Razorpay. Every transaction amount you see is in Indian Rupees (INR) -- when
@@ -158,12 +174,28 @@ def run_risk_agent(
 
     for turn in range(MAX_TURNS):
         _emit(on_step, {"type": "thinking", "turn": turn + 1})
+        # On the last available turn, stop letting the model choose freely
+        # ("auto" -- which is exactly how it kept choosing to investigate
+        # further, or to reply in plain prose, right up until the turn
+        # budget ran out with no proposal ever submitted) and force it to
+        # call submit_decision specifically. This still respects "the
+        # score/decide_from_score gate is the real authority, not the
+        # agent" -- forcing WHICH tool is called on the final turn doesn't
+        # change what the gate does with the score, it just guarantees the
+        # comparison this feature exists to show (agent's proposal vs. the
+        # gate's decision) actually has an agent proposal to compare, on a
+        # turn where the alternative was certain to end in "ran out of
+        # turns, no proposal" anyway.
+        is_last_turn = turn == MAX_TURNS - 1
+        tool_choice = (
+            {"type": "function", "function": {"name": FINAL_ANSWER_TOOL}} if is_last_turn else "auto"
+        )
         try:
             response = client.chat.completions.create(
                 model=model,
                 messages=messages,
                 tools=TOOL_SCHEMAS,
-                tool_choice="auto",
+                tool_choice=tool_choice,
             )
             message = response.choices[0].message
         except Exception:
@@ -365,8 +397,41 @@ def _finalize(agent_proposal, agent_raw_response, computed_risk_score, explanati
 
 
 def _parse_final_json(text: str):
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        # Agent didn't follow the format -- don't guess at its intent.
-        return None
+    """
+    Best-effort parse of a plain-text final answer into the same
+    {recommended_decision, reasoning} shape submit_decision expects.
+
+    Only reached when the model ignores submit_decision entirely and
+    replies in plain text instead (the tool-call path above is what
+    normally happens, and is what forcing tool_choice on the last turn is
+    meant to make even more reliable) -- but plain-text replies observed
+    in practice are usually "almost" valid JSON, not unstructured prose: a
+    markdown code fence around an otherwise-valid object (` ```json
+    {...} ``` `), or a JSON object with a sentence of commentary before or
+    after it. Recovering those two specific, superficial formatting
+    patterns is worthwhile; anything else correctly still falls through to
+    None -- this must never GUESS at intent for text with no embedded JSON
+    object at all, only strip formatting around JSON that's really there.
+    """
+    candidates = [text]
+
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        # Drop the opening fence line (```` ``` `` or ```` ```json ``` ``)
+        # and the closing ```` ``` ````, if present.
+        after_open = stripped.split("\n", 1)[1] if "\n" in stripped else ""
+        candidates.append(after_open.rsplit("```", 1)[0].strip())
+
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+    if first_brace != -1 and last_brace > first_brace:
+        candidates.append(text[first_brace : last_brace + 1])
+
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    # Agent didn't follow the format and no embedded JSON object was
+    # recoverable -- don't guess at its intent.
+    return None

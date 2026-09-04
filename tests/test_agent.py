@@ -15,8 +15,8 @@ from types import SimpleNamespace
 import pytest
 
 from agent.merchant_context import get_merchant_context
-from agent.risk_agent import _finalize, run_risk_agent
-from agent.tools import RiskAgentTools
+from agent.risk_agent import MAX_TURNS, _finalize, _parse_final_json, run_risk_agent
+from agent.tools import FINAL_ANSWER_TOOL, RiskAgentTools
 from audit.audit_log import get_connection, log_event
 from explainability.explain import RiskExplainer
 from pipeline import load_model
@@ -55,6 +55,20 @@ class ScriptedGroqClient:
         response = self._responses[self.call_count]
         self.call_count += 1
         return response
+
+
+class KwargRecordingGroqClient(ScriptedGroqClient):
+    """Like ScriptedGroqClient, but also records the kwargs (in particular
+    tool_choice) passed to each chat.completions.create call, so a test can
+    assert on HOW a turn was requested, not just what was returned."""
+
+    def __init__(self, responses):
+        super().__init__(responses)
+        self.recorded_kwargs = []
+
+    def _create(self, **kwargs):
+        self.recorded_kwargs.append(kwargs)
+        return super()._create(**kwargs)
 
 
 @pytest.fixture(scope="module")
@@ -528,3 +542,100 @@ def test_tool_call_with_none_arguments_does_not_crash_the_loop(tools):
     # malformed JSON text does, and the loop continues normally.
     assert result["risk_score"] is not None
     assert result["trace"][0]["tool"] == "get_merchant_context"
+
+
+def test_only_the_final_turn_forces_submit_decision(tools):
+    """
+    Regression test: found live, every real Live Agent demo run observed so
+    far ended with "No proposal" -- the model kept investigating (or
+    replied in plain prose) right up until MAX_TURNS ran out, because
+    tool_choice was "auto" on every turn, including the last one, so
+    nothing ever required it to actually call submit_decision. The fix
+    forces tool_choice to submit_decision specifically on the LAST
+    available turn only -- every earlier turn must still be "auto" (an
+    agent that's only investigated once so far must remain free to keep
+    investigating, not be forced to answer prematurely).
+    """
+    responses = [
+        _response(_tool_message([_tool_call(str(i), "get_merchant_context", {"merchant_id": "AGT9"})]))
+        for i in range(MAX_TURNS - 1)
+    ] + [
+        _response(
+            _tool_message(
+                [_tool_call("last", "submit_decision", {"recommended_decision": "clear", "reasoning": "ok"})]
+            )
+        )
+    ]
+    scripted = KwargRecordingGroqClient(responses)
+
+    run_risk_agent({"merchant_id": "AGT9", "daily_txn_volume": 9000}, tools, groq_client=scripted)
+
+    assert len(scripted.recorded_kwargs) == MAX_TURNS
+    for kwargs in scripted.recorded_kwargs[:-1]:
+        assert kwargs["tool_choice"] == "auto"
+    assert scripted.recorded_kwargs[-1]["tool_choice"] == {
+        "type": "function",
+        "function": {"name": FINAL_ANSWER_TOOL},
+    }
+
+
+def test_forcing_the_final_turn_produces_a_real_proposal_instead_of_a_timeout(tools):
+    """
+    End-to-end version of the above: an agent that would otherwise spend
+    every turn investigating (never once choosing to call submit_decision
+    on its own) now still ends with a real agent_proposal on the final
+    turn, instead of silently hitting the "ran out of turns, no proposal"
+    fail-safe every single one of the pre-fix live demo runs actually hit.
+    """
+    responses = [
+        _response(_tool_message([_tool_call(str(i), "score_transaction_risk", MERCHANT_ARGS)]))
+        for i in range(MAX_TURNS - 1)
+    ] + [
+        _response(
+            _tool_message(
+                [
+                    _tool_call(
+                        "last", "submit_decision",
+                        {"recommended_decision": "escalate", "reasoning": "Investigated thoroughly."},
+                    )
+                ]
+            )
+        )
+    ]
+    scripted = ScriptedGroqClient(responses)
+
+    result = run_risk_agent({"merchant_id": "AGT10", "daily_txn_volume": 9000}, tools, groq_client=scripted)
+
+    assert result["agent_proposal"] == {"recommended_decision": "escalate", "reasoning": "Investigated thoroughly."}
+    assert result["gated_decision"] in {"clear", "escalate", "flag_for_compliance_review", "needs_manual_review"}
+
+
+def test_parse_final_json_handles_a_markdown_fenced_reply():
+    # A model that ignores submit_decision but still writes valid JSON,
+    # wrapped in a ```json fence -- a common plain-text formatting habit --
+    # should still be recovered instead of treated as "no proposal".
+    text = '```json\n{"recommended_decision": "clear", "reasoning": "Looks fine."}\n```'
+    assert _parse_final_json(text) == {"recommended_decision": "clear", "reasoning": "Looks fine."}
+
+
+def test_parse_final_json_handles_a_plain_fence_without_a_language_tag():
+    text = '```\n{"recommended_decision": "escalate", "reasoning": "Elevated risk."}\n```'
+    assert _parse_final_json(text) == {"recommended_decision": "escalate", "reasoning": "Elevated risk."}
+
+
+def test_parse_final_json_recovers_json_surrounded_by_prose():
+    text = (
+        'Based on my investigation, here is my recommendation:\n'
+        '{"recommended_decision": "flag_for_compliance_review", "reasoning": "High chargeback rate."}\n'
+        'Let me know if you need anything else.'
+    )
+    assert _parse_final_json(text) == {
+        "recommended_decision": "flag_for_compliance_review",
+        "reasoning": "High chargeback rate.",
+    }
+
+
+def test_parse_final_json_still_returns_none_for_genuinely_unstructured_text():
+    # Must not guess at intent when there's no embedded JSON object at all --
+    # this is the case that correctly stays "no proposal".
+    assert _parse_final_json("I think this transaction looks fine overall.") is None
