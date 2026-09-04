@@ -520,6 +520,22 @@ def render_override_section(view: dict):
     if overrides:
         html_block(override_banner_html(overrides))
 
+    # A submitted override used to call st.success("Override recorded.")
+    # immediately followed by st.rerun() -- st.rerun() aborts the current
+    # script run right away, so that success message was never actually
+    # given a chance to reach the browser before the page tore down and
+    # restarted. The write itself still happened (log_override runs first,
+    # and does its own commit), but the reviewer got no visible
+    # confirmation at all, which reads exactly like "nothing happened" even
+    # though it did. Fix: stash a one-shot flag in session_state before
+    # rerunning, then show the success message on the FOLLOWING render
+    # (this one) -- which also has the nice side effect of appearing right
+    # next to the now-current override_banner_html above, instead of a
+    # toast with no lasting evidence on screen either way.
+    just_recorded_key = f"_override_just_recorded_{event_id}"
+    if st.session_state.pop(just_recorded_key, False):
+        st.success("Override recorded.")
+
     decision_options = [DECISION_CLEAR, DECISION_ESCALATE, DECISION_FLAG, DECISION_MANUAL_REVIEW]
     current_decision = overrides[0]["overridden_decision"] if overrides else view["decision"]
     default_index = decision_options.index(current_decision) if current_decision in decision_options else 0
@@ -554,7 +570,7 @@ def render_override_section(view: dict):
                         overridden_decision=new_decision,
                         reason=reason.strip(),
                     )
-                    st.success("Override recorded.")
+                    st.session_state[just_recorded_key] = True
                     st.rerun()
 
 
