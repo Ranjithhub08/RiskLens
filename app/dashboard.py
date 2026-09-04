@@ -594,7 +594,7 @@ def page_overview():
             if len(scored) >= 3:
                 df = pd.DataFrame(scored)[["timestamp_utc", "risk_score", "decision"]]
                 df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce")
-                st.altair_chart(risk_activity_chart(df), width="stretch")
+                st.altair_chart(risk_activity_chart(df), use_container_width=True)
             else:
                 st.caption(
                     f"Not enough scored events yet to plot risk over time (need at least 3, have {len(scored)}). "
@@ -609,7 +609,7 @@ def page_overview():
                 counts[d] = counts.get(d, 0) + 1
         with st.container(border=True, key="panel_risk_distribution"):
             html_block('<div class="rl-panel-label">Risk distribution</div>')
-            st.altair_chart(risk_distribution_chart(counts), width="stretch")
+            st.altair_chart(risk_distribution_chart(counts), use_container_width=True)
 
     with st.container(border=True, key="panel_recent_investigations"):
         html_block('<div class="rl-panel-label">Recent investigations</div>')
@@ -633,7 +633,7 @@ def page_overview():
                         "Time": relative_time(view["timestamp_utc"]),
                     }
                 )
-            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
     col_health, col_story = st.columns([1, 1.3])
     with col_health:
@@ -846,7 +846,7 @@ def page_investigations():
         st.caption(f"{len(filtered)} of {len(views)} cases shown.")
         table_df = pd.DataFrame(table_rows)
         event = st.dataframe(
-            table_df, hide_index=True, width="stretch",
+            table_df, hide_index=True, use_container_width=True,
             on_select="rerun", selection_mode="single-row", key="cases_table",
         )
 
@@ -1027,7 +1027,7 @@ def page_batch_scoring():
 
         sort_desc = st.checkbox("Sort by risk score (highest first)", value=True)
         display_df = results_df.sort_values("Risk score", ascending=not sort_desc, na_position="last")
-        st.dataframe(display_df, hide_index=True, width="stretch")
+        st.dataframe(display_df, hide_index=True, use_container_width=True)
 
         st.download_button(
             "Download full batch report (CSV)",
@@ -1270,15 +1270,15 @@ def page_models():
     with col_roc:
         with st.container(border=True, key="panel_roc_curve"):
             html_block('<div class="rl-panel-label">ROC curve</div>')
-            st.altair_chart(roc_chart(chart_data["roc_curve"]), width="stretch")
+            st.altair_chart(roc_chart(chart_data["roc_curve"]), use_container_width=True)
     with col_cm:
         with st.container(border=True, key="panel_confusion_matrix"):
             html_block(f'<div class="rl-panel-label">Confusion matrix &middot; XGBoost (threshold {xgb["threshold"]:.2f})</div>')
-            st.altair_chart(confusion_matrix_chart(chart_data["confusion_matrix"]), width="stretch")
+            st.altair_chart(confusion_matrix_chart(chart_data["confusion_matrix"]), use_container_width=True)
 
     with st.container(border=True, key="panel_shap_global"):
         html_block('<div class="rl-panel-label">Global feature importance (SHAP, test set)</div>')
-        st.altair_chart(shap_global_chart(chart_data["shap_global_importance"]), width="stretch")
+        st.altair_chart(shap_global_chart(chart_data["shap_global_importance"]), use_container_width=True)
 
     render_threshold_explorer(xgb["threshold"])
     render_retrain_from_feedback_section()
@@ -1370,7 +1370,7 @@ def render_threshold_explorer(default_threshold: float):
     cm_data = {"labels": ["Not risky", "Risky"], "matrix": [[tn, fp], [fn, tp]]}
     with st.container(border=True, key="panel_threshold_cm"):
         html_block(f'<div class="rl-panel-label">Confusion matrix at threshold {threshold:.2f}</div>')
-        st.altair_chart(confusion_matrix_chart(cm_data), width="stretch")
+        st.altair_chart(confusion_matrix_chart(cm_data), use_container_width=True)
 
 
 def render_retrain_from_feedback_section():
@@ -1531,7 +1531,7 @@ def render_monitoring_section(events: list):
         vol_df["timestamp_utc"] = pd.to_datetime(vol_df["timestamp_utc"], utc=True, errors="coerce")
         with st.container(border=True, key="panel_decision_volume"):
             html_block('<div class="rl-panel-label">Decision volume over time</div>')
-            st.altair_chart(decision_volume_chart(vol_df), width="stretch")
+            st.altair_chart(decision_volume_chart(vol_df), use_container_width=True)
     else:
         st.caption(f"Not enough events yet to plot volume over time (need at least 3, have {len(dated)}).")
 
@@ -1576,7 +1576,7 @@ def page_audit_trail():
         filtered = filtered[filtered["merchant_id"].astype(str).str.contains(merchant_search, case=False, na=False, regex=False)]
 
     display_cols = ["timestamp_utc", "source", "merchant_id", "risk_score", "decision", "decision_reason"]
-    st.dataframe(filtered[display_cols], hide_index=True, width="stretch")
+    st.dataframe(filtered[display_cols], hide_index=True, use_container_width=True)
     st.caption(f"{len(filtered)} of {len(df_events)} audit events shown. Every row is written once and never edited or deleted.")
 
     with st.expander("Inspect a single event's full record"):
@@ -1613,7 +1613,7 @@ def page_audit_trail():
             f"{len(overrides)} reviewer correction(s) recorded so far -- this table is the training signal "
             "a feedback-driven retrain would use."
         )
-        st.dataframe(overrides_df, hide_index=True, width="stretch")
+        st.dataframe(overrides_df, hide_index=True, use_container_width=True)
         st.download_button(
             "Download feedback as CSV",
             data=overrides_df.to_csv(index=False),
